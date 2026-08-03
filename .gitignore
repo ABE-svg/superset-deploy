@@ -1,0 +1,22 @@
+# ---------------------------------------------------------------------------
+# Segredos — NUNCA commitar. O arquivo real vive só no servidor.
+# ---------------------------------------------------------------------------
+docker/.env-local
+docker/.env
+*.pem
+*.key
+*.p12
+
+# Certificados e desafios do certbot (gerados em runtime)
+conf/certbot/
+
+# Logs do nginx (bind mount)
+logs/
+
+# Backups deixados por edições em produção
+*.bak
+*.bak-*
+*.old
+
+# Sistema
+.DS_Store
