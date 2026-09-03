@@ -40,6 +40,11 @@ FEATURE_FLAGS = {
     "AG_GRID_TABLE_ENABLED": True,
     # Libera os plugins experimentais (hoje: Big Number período a período).
     "CHART_PLUGINS_EXPERIMENTAL": True,
+    # Report de dashboard respeitando o estado salvo em `extra.dashboard`
+    # (abas e filtros nativos). Sem isto o worker ignora `nativeFilters` e manda
+    # o dashboard sem filtro — o report "uso-humano" depende disto
+    # (Período = Last month, Origem = prod, Tipo de usuário = Cliente).
+    "ALERT_REPORT_TABS": True,
 }
 
 # ⚠️ IMPORTANTE: Desabilitar dry-run mode para enviar emails reais
