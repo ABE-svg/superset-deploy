@@ -186,7 +186,11 @@ services:
     healthcheck:
       disable: true
 
+  # Só para Global Async Queries (GAQ), que NÃO usamos. Fica atrás de um profile
+  # para o `compose up -d` não subi-lo: sem GAQ o docker-bootstrap.sh responde
+  # "Unknown Operation!!!" e o container entra em restart loop (visto no upgrade 6.1.0).
   superset-websocket:
+    profiles: ["gaq"]
     env_file:
       - path: docker/.env
         required: true

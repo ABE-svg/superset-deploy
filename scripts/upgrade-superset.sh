@@ -41,4 +41,10 @@ for i in $(seq 1 60); do
 done
 docker compose ps
 docker compose exec -T superset /app/.venv/bin/python -c "from superset import config; print('VERSION_STRING =', config.VERSION_STRING)"
+
+# O nginx resolve o upstream `superset` no parse da config; o container recriado
+# tem IP novo e o site fica em 502 até o reload (armadilha 2 do README).
+echo ">> reload do nginx (upstream recriado)"
+docker compose exec -T nginx nginx -t && docker compose exec -T nginx nginx -s reload
+curl -sk -o /dev/null -w "health via nginx: %{http_code}\n" https://127.0.0.1/health || true
 echo ">> ok. Rollback: TAG/BROWSER_TAG de volta + restore do dump (ver scripts/backup-db.sh)."

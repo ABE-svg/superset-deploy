@@ -174,8 +174,11 @@ Registro do 6.0.0 → 6.1.0 (03/09/2026), que é o roteiro para os próximos:
 3. Subir `TAG`/`BROWSER_TAG` em `docker/.env-local` e os defaults no
    `docker-compose.yml` e `docker-browser/Dockerfile` (`ARG SUPERSET_VERSION`).
 4. `sudo ./scripts/upgrade-superset.sh 6.1.0` — pull, build do browser, `compose up -d`
-   (o `superset-init` roda `superset db upgrade` + `superset init`), espera health e
-   imprime `VERSION_STRING`.
+   (o `superset-init` roda `superset db upgrade` + `superset init`), espera health,
+   imprime `VERSION_STRING` e **recarrega o nginx** — sem isso o site fica em 502,
+   porque o nginx guardou o IP do container antigo (armadilha 2).
+   Nota: a migração 6.0.0 → 6.1.0 levou ~2 min; o `.env-local` novo faz o compose
+   recriar também o `db` (só restart do Postgres, dados no volume).
 5. Conferir: login, um dashboard de cada tipo, um Report em dry-run (seção abaixo),
    e *Settings > Themes* mostrando o tema Astecha.
 6. Rollback: `TAG`/`BROWSER_TAG` de volta + `pg_restore --clean` do dump (o

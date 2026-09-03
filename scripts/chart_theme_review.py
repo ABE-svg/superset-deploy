@@ -44,6 +44,10 @@ SEMANTIC_LABEL_COLORS = {
 SEQUENTIAL_KEYS = ("linear_color_scheme",)
 
 _token = None
+_csrf = None
+# Cookie jar: o CSRF do Superset é validado contra a sessão (cookie), então o
+# token de /security/csrf_token só vale se a mesma sessão for reenviada no PUT.
+_opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
 
 
 def login():
@@ -55,25 +59,25 @@ def login():
     }).encode()
     req = urllib.request.Request(f"{BASE}/api/v1/security/login", data=body,
                                  headers={"Content-Type": "application/json"})
-    _token = json.load(urllib.request.urlopen(req))["access_token"]
+    _token = json.load(_opener.open(req))["access_token"]
 
 
 def call(method, ep, payload=None):
+    global _csrf
     if _token is None:
         login()
+    headers = {"Authorization": f"Bearer {_token}", "Content-Type": "application/json",
+               "Referer": BASE + "/"}
+    if method != "GET":
+        if _csrf is None:
+            _csrf = call("GET", "/api/v1/security/csrf_token/")["result"]
+        headers["X-CSRFToken"] = _csrf
     data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(f"{BASE}{ep}", data=data, method=method, headers={
-        "Authorization": f"Bearer {_token}", "Content-Type": "application/json",
-        "Referer": BASE + "/",
-    })
+    req = urllib.request.Request(f"{BASE}{ep}", data=data, method=method, headers=headers)
     try:
-        return json.load(urllib.request.urlopen(req))
+        return json.load(_opener.open(req))
     except urllib.error.HTTPError as e:
         sys.exit(f"HTTP {e.code} {method} {ep}: {e.read()[:400]!r}")
-
-
-def csrf():
-    return call("GET", "/api/v1/security/csrf_token/")["result"]
 
 
 def all_charts():
