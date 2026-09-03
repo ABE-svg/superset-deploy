@@ -120,9 +120,19 @@ SCREENSHOT_PLAYWRIGHT_WAIT_EVENT = "networkidle"
 
 # Teto de cada espera individual do Playwright. Se a rede nunca silenciar, o
 # goto estoura esse timeout, e logado e o fluxo segue assim mesmo (nao perde o
-# print). Cuidado ao aumentar: CeleryConfig.task_soft_time_limit e 180s e vale
-# para a execucao inteira do report.
-SCREENSHOT_PLAYWRIGHT_DEFAULT_TIMEOUT = 60000
+# print) — MAS a espera seguinte, `element.wait_for()` do seletor .standalone,
+# estoura de verdade e derruba o report ("Failed taking a screenshot").
+#
+# 60s nao bastava para o dashboard uso-humano (20 charts, ~5,3k px de altura:
+# cai no caminho de screenshot em tiles) com force_screenshot ligado, que
+# re-executa as 20 queries. Medido em 03/09/2026: 3 tentativas manuais, 2
+# estouraram em 60s. 150s cobre o pior caso observado com folga.
+#
+# Nao conflita com o limite do Celery: para reports AGENDADOS o scheduler
+# (tasks/scheduler.py) define soft_time_limit = working_timeout + 1 = 3601s por
+# task, ignorando o global de 180s. O global so vale para chamada manual da
+# task, e a de thumbnail tem soft_time_limit=300s fixo — 150s cabe nos dois.
+SCREENSHOT_PLAYWRIGHT_DEFAULT_TIMEOUT = 150000
 
 # A espera dos .loading so cobre os elementos existentes NAQUELE instante:
 # grafico que ainda nao comecou a renderizar (lazy-load abaixo da dobra) nao
