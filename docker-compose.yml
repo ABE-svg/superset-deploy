@@ -21,13 +21,16 @@
 # Remove componentes desnecessários para produção (Node, Cypress)
 # Use imagem pré-compilada do Superset
 
-version: '3.8'
 
-x-superset-image: &superset-image apachesuperset.docker.scarf.sh/apache/superset:${TAG:-latest}
+# Versão PINADA. Nunca usar `latest`: em 31/08/2026 a tag `latest` do Docker Hub
+# passou de 6.0.0 para 6.1.0 sem aviso, e um `docker compose pull` casual teria
+# feito o upgrade (com migração de banco) sem ninguém pedir. TAG e BROWSER_TAG
+# andam juntos — a imagem do browser é FROM apache/superset:${SUPERSET_VERSION}.
+x-superset-image: &superset-image apachesuperset.docker.scarf.sh/apache/superset:${TAG:-6.1.0}
 # Mesma imagem + Playwright/Chromium, para os screenshots de Alerts & Reports.
-# Build: docker build -t astecha/superset-browser:6.0.0 docker-browser/
+# Build: docker build --build-arg SUPERSET_VERSION=6.1.0 -t astecha/superset-browser:6.1.0 docker-browser/
 # Só o worker precisa do browser (ver docs de Alerts and Reports).
-x-superset-browser-image: &superset-browser-image astecha/superset-browser:${BROWSER_TAG:-6.0.0}
+x-superset-browser-image: &superset-browser-image astecha/superset-browser:${BROWSER_TAG:-6.1.0}
 
 services:
   nginx:
@@ -101,6 +104,9 @@ services:
     volumes:
       - ./docker:/app/docker
       - superset_home:/app/superset_home
+      # Assets da marca (logos) servidos em /static/assets/astecha/ — referenciados
+      # pelo tema em docker/themes/*.json e por APP_ICON no superset_config_docker.py.
+      - ./docker/assets:/app/superset/static/assets/astecha:ro
     networks:
       - superset
     healthcheck:

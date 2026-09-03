@@ -34,6 +34,12 @@ FEATURE_FLAGS = {
     # Com a flag ligada, WEBDRIVER_TYPE abaixo deixa de ter efeito:
     # Playwright é sempre Chromium.
     "PLAYWRIGHT_REPORTS_AND_THUMBNAILS": True,
+    # ---- Gráficos (6.x) ----
+    # Table V2 com AG Grid: barras nas células, formatação condicional por linha,
+    # pin/filtro por coluna, time shift. Vem na imagem, mas desligada por padrão.
+    "AG_GRID_TABLE_ENABLED": True,
+    # Libera os plugins experimentais (hoje: Big Number período a período).
+    "CHART_PLUGINS_EXPERIMENTAL": True,
 }
 
 # ⚠️ IMPORTANTE: Desabilitar dry-run mode para enviar emails reais
@@ -144,6 +150,121 @@ ALERT_REPORTS_NOTIFICATION_METHODS = ["Email"]
 # SLACK_API_TOKEN = os.getenv("SLACK_API_TOKEN", "")
 # FEATURE_FLAGS["ALERT_REPORT_SLACK_V2"] = True
 # ALERT_REPORTS_NOTIFICATION_METHODS.append("Slack")
+
+# =========================================================================
+# BRANDING, TEMA E PALETAS (Superset 6.x)
+# =========================================================================
+# O tema fica em JSON versionado (docker/themes/*.json) e é carregado aqui para
+# que o config continue sendo a única fonte da verdade. Na subida do app o
+# Superset faz upsert desses dois temas como "THEME_DEFAULT"/"THEME_DARK"
+# (is_system=True) na tabela `themes` — ver superset/commands/theme/seed.py.
+# Enquanto nenhum tema for marcado como "system default" na UI
+# (Settings > Themes), o que vale é o do config.
+#
+# Logos e demais assets estáticos: docker/assets/ é montado em
+# /app/superset/static/assets/astecha (ver docker-compose.yml), logo o caminho
+# público é /static/assets/astecha/<arquivo>.
+#
+# Fontes: o CSP do Superset (TALISMAN_CONFIG) só libera fonts.googleapis.com,
+# fonts.gstatic.com e use.typekit.*; por isso Fira Sans/Fira Code vêm do Google
+# Fonts em vez de self-hosted (THEME_FONT_URL_ALLOWED_DOMAINS).
+
+import json as _json
+from pathlib import Path as _Path
+
+_THEMES_DIR = _Path(__file__).resolve().parent.parent / "themes"  # /app/docker/themes
+
+
+def _load_theme(filename: str) -> dict:
+    return _json.loads((_THEMES_DIR / filename).read_text(encoding="utf-8"))
+
+
+APP_NAME = "Astecha Dashboard"
+APP_ICON = "/static/assets/astecha/astecha-logo-light.png"
+
+THEME_DEFAULT = _load_theme("astecha-light.json")
+THEME_DARK = _load_theme("astecha-dark.json")
+
+# Paleta categórica = a mesma ASTECHA_PALETTE usada nos gráficos do home-app
+# (frontend/src/lib/echarts.js), para os dashboards do Superset e do app
+# lerem como um produto só. isDefault=True faz dela o esquema padrão de todo
+# gráfico novo e de todo gráfico que não fixou esquema.
+EXTRA_CATEGORICAL_COLOR_SCHEMES = [
+    {
+        "id": "astecha",
+        "label": "Astecha",
+        "description": "Paleta categórica institucional (mesma do home-app)",
+        "isDefault": True,
+        "colors": [
+            "#0D0D38",  # azul quase preto — âncora
+            "#001EAF",  # azul profundo
+            "#2044DC",  # azul
+            "#4571FF",  # azul claro
+            "#88AAFF",  # azul pastel
+            "#FF6B06",  # laranja
+            "#FFBB8D",  # laranja pastel
+            "#F8485E",  # vermelho
+            "#FF99AF",  # rosa
+            "#46E8E0",  # turquesa
+            "#B6FFE3",  # verde água
+            "#A6A6A6",  # cinza
+            "#118680",  # verde petróleo
+            "#DBDBF7",  # lilás claro
+            "#C65000",  # laranja queimado
+        ],
+    },
+]
+
+# Escalas sequenciais/divergentes derivadas da escala de roxo/vermelho da marca
+# (astecha.css --purple-* / --red-*) e da rampa de risco (--risk-0..5).
+EXTRA_SEQUENTIAL_COLOR_SCHEMES = [
+    {
+        "id": "astechaPurple",
+        "label": "Astecha — roxo",
+        "description": "Sequencial claro→escuro na escala de roxo da marca",
+        "isDiverging": False,
+        "isDefault": True,
+        "colors": [
+            "#EFEAFB", "#D4C6F4", "#AD95E8", "#8463DB", "#5A33CC",
+            "#3B0FAA", "#270173", "#1F015C", "#170144",
+        ],
+    },
+    {
+        "id": "astechaRedPurple",
+        "label": "Astecha — vermelho ↔ roxo",
+        "description": "Divergente: vermelho da marca ↔ roxo da marca",
+        "isDiverging": True,
+        "isDefault": False,
+        "colors": [
+            "#A91718", "#D21D1E", "#F64A4B", "#FBA3A4", "#FEECEC",
+            "#EFEAFB", "#AD95E8", "#5A33CC", "#270173",
+        ],
+    },
+    {
+        "id": "astechaRisk",
+        "label": "Astecha — risco (ok → crítico)",
+        "description": "Rampa de severidade sóbria: sálvia → âmbar → tijolo → marrom",
+        "isDiverging": False,
+        "isDefault": False,
+        "colors": ["#4E7A63", "#B08A4A", "#A8703E", "#A85D4A", "#8A4438", "#6E3530"],
+    },
+]
+
+# =========================================================================
+# COORDENAÇÃO DISTRIBUÍDA (novo na 6.1 — Global Task Framework)
+# =========================================================================
+# Backend Redis unificado para locks e pub/sub entre workers. O UPDATING.md da
+# 6.1.0 recomenda configurar em toda instalação de produção com Redis. Reusa o
+# mesmo Redis/DB do CACHE_CONFIG do upstream (docker/pythonpath_dev/superset_config.py).
+DISTRIBUTED_COORDINATION_CONFIG = {
+    "CACHE_TYPE": "RedisCache",
+    "CACHE_KEY_PREFIX": "signal_",
+    "CACHE_REDIS_URL": (
+        f"redis://{os.getenv('REDIS_HOST', 'redis')}:{os.getenv('REDIS_PORT', '6379')}/"
+        f"{os.getenv('REDIS_RESULTS_DB', '1')}"
+    ),
+    "CACHE_DEFAULT_TIMEOUT": 300,
+}
 
 # =========================================================================
 # LOGGING

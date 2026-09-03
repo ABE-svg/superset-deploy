@@ -19,9 +19,10 @@
 # Build:
 #   docker compose --profile browser build superset-worker
 # ou:
-#   docker build -t astecha/superset-browser:6.0.0 docker-browser/
+#   docker build --build-arg SUPERSET_VERSION=6.1.0 -t astecha/superset-browser:6.1.0 docker-browser/
 #
-ARG SUPERSET_VERSION=6.0.0
+# A versão aqui tem que ser a MESMA do TAG do docker-compose.yml / .env-local.
+ARG SUPERSET_VERSION=6.1.0
 FROM apache/superset:${SUPERSET_VERSION}
 
 USER root

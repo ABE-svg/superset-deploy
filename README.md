@@ -1,12 +1,19 @@
 # superset-deploy
 
-Configuração de deploy de uma instância **Apache Superset 6.0.0** em Docker Compose,
+Configuração de deploy de uma instância **Apache Superset 6.1.0** em Docker Compose,
 com **Alerts & Reports funcionando de verdade** — isto é, mandando print de gráfico
-por e-mail.
+por e-mail — e com o **tema visual da Astecha** (logo, cores, fontes e paleta dos
+gráficos) versionado como código.
 
 Este repositório guarda **só o que é nosso**: a imagem customizada com headless
-browser, o nginx com TLS, o override de configuração do Superset e os scripts de
-certificado. O Superset em si continua vindo da imagem oficial.
+browser, o nginx com TLS, o override de configuração do Superset, o tema e os
+assets da marca, e os scripts de certificado, backup e upgrade. O Superset em si
+continua vindo da imagem oficial, **com a versão pinada** (nunca `latest`).
+
+Onde roda: EC2 `dashboards-prod` (`i-07a5ae79baa590070`, us-east-2), diretório
+`/home/ubuntu/superset`, acesso por **SSM** (`aws ssm start-session` / `send-command`;
+a porta 22 não é pública desde o zero-trust). URL: https://dashboard.astecha.com.br
+(via WARP).
 
 ---
 
@@ -53,11 +60,16 @@ desde a 4.1.x e o que o Dockerfile oficial faz via `--build-arg INCLUDE_CHROMIUM
 
 | Caminho | O que é |
 |---|---|
-| `docker-browser/Dockerfile` | imagem `apache/superset:6.0.0` + Playwright + Chromium |
-| `docker-compose.yml` | stack completa; só o `superset-worker` usa a imagem com browser |
+| `docker-browser/Dockerfile` | imagem `apache/superset:${SUPERSET_VERSION}` + Playwright + Chromium |
+| `docker-compose.yml` | stack completa, versão pinada via `TAG`/`BROWSER_TAG`; só o `superset-worker` usa a imagem com browser |
 | `conf/nginx/` | `nginx.conf` + vhost TLS com headers de segurança |
-| `docker/pythonpath_dev/superset_config_docker.py` | override de config do Superset (SMTP, feature flags, esperas do screenshot) |
+| `docker/pythonpath_dev/superset_config_docker.py` | override de config do Superset (SMTP, feature flags, esperas do screenshot, branding, tema, paletas) |
+| `docker/themes/astecha-light.json`, `astecha-dark.json` | tema Astecha (tokens Ant Design + overrides ECharts), carregado pelo config |
+| `docker/assets/` | logos da marca, montados em `/static/assets/astecha/` |
 | `docker/.env-local.example` | modelo do arquivo de segredos (o real nunca é commitado) |
+| `scripts/backup-db.sh` | backup do metadata DB + volume antes de qualquer upgrade |
+| `scripts/upgrade-superset.sh` | pull + build + `compose up` com migração, para subir de versão |
+| `scripts/chart_theme_review.py` | revisão dos charts/dashboards existentes para aderirem ao tema (via API) |
 | `scripts/init-letsencrypt.sh` | emissão inicial do certificado |
 | `scripts/renew-cert.sh` | renovação + reload seguro do nginx |
 
@@ -72,8 +84,8 @@ git clone <este-repo> superset-deploy && cd superset-deploy
 cp docker/.env-local.example docker/.env-local
 $EDITOR docker/.env-local      # SUPERSET_SECRET_KEY, MAIL_PASSWORD, domínio
 
-# 2. Imagem com o headless browser (só o worker precisa dela)
-docker build -t astecha/superset-browser:6.0.0 docker-browser/
+# 2. Imagem com o headless browser (só o worker precisa dela) — mesma versão do TAG
+docker build --build-arg SUPERSET_VERSION=6.1.0 -t astecha/superset-browser:6.1.0 docker-browser/
 
 # 3. Certificado (primeira vez)
 EMAIL=voce@dominio DOMAIN=seu.dominio ./scripts/init-letsencrypt.sh
@@ -84,6 +96,95 @@ docker compose up -d
 
 O `docker/` do upstream (`docker-bootstrap.sh`, `docker-init.sh`, `.env`) continua
 vindo do repositório do Superset — este repo cobre apenas os arquivos próprios.
+
+---
+
+## Tema Astecha (branding, cores, fontes, gráficos)
+
+Tudo é configuração, nada é fork: o Superset 6 tem tema por tokens (Ant Design v5)
+e overrides de ECharts por tema, e é isso que usamos.
+
+| Camada | Onde | O que controla |
+|---|---|---|
+| `THEME_DEFAULT` / `THEME_DARK` | `superset_config_docker.py` ← `docker/themes/*.json` | logo, nome do app, cor primária/links/estados, fonte (Fira Sans / Fira Code via Google Fonts), raio de borda |
+| `echartsOptionsOverrides` | dentro do JSON do tema | fonte dos gráficos, legenda com marcador redondo, tooltip sem borda e com sombra |
+| `echartsOptionsOverridesByChartType` | idem, chave = `viz_type` | barras com canto arredondado, linhas 2.5px, fatias de pizza/treemap com separador |
+| `EXTRA_CATEGORICAL_COLOR_SCHEMES` | `superset_config_docker.py` | paleta `astecha` (mesma `ASTECHA_PALETTE` do home-app), **default** para todo gráfico |
+| `EXTRA_SEQUENTIAL_COLOR_SCHEMES` | idem | `astechaPurple` (default), `astechaRedPurple` (divergente), `astechaRisk` (ok → crítico) |
+| `APP_NAME` / `APP_ICON` | idem | título da aba e logo do favicon/header |
+
+Como o tema entra no ar: na subida do app o Superset faz **upsert** de
+`THEME_DEFAULT`/`THEME_DARK` na tabela `themes` (`is_system=True`). Com
+`ENABLE_UI_THEME_ADMINISTRATION` (default `True`), a UI em *Settings > Themes*
+mostra esses dois como "system"; enquanto ninguém marcar outro tema como *system
+default* na UI, o que vale é o do config. **Se alguém setar um tema pela UI, ele
+passa a ganhar do config** — por isso a regra é: edita-se o JSON no repo, não na UI.
+
+Para testar uma mudança de tema sem deploy: cole o JSON em *Settings > Themes >
++ Theme* e aplique só num dashboard (*Edit dashboard > ... > Theme*). Quando
+aprovar, leve para `docker/themes/` e faça deploy.
+
+### Ferramentas do 6.1 que substituem "plugin de gráfico"
+
+Não existe loja de extensões de gráficos para o Superset, e os plugins de terceiros
+listados no wiki oficial são de 2021–2023 (React 16 / `@superset-ui/core` 0.17) —
+não rodam na 6.x. O framework de *Extensions* (`.supx`) da 6.x também **não**
+registra tipos de gráfico (só views, comandos, menus, editores, SQL Lab). O que dá
+para usar sem rebuild:
+
+- **Editor de opções ECharts por gráfico** (6.1, aba *Customize > ECharts Options*):
+  JSON deep-merged por cima do que o Superset gera. Qualquer opção do ECharts
+  (gradiente, rótulo, sombra, `smooth`, etc.).
+- **Table V2 com AG Grid** (`AG_GRID_TABLE_ENABLED`, ligado aqui): barras nas
+  células, formatação condicional por linha, pin/filtro por coluna, time shift.
+- **Big Number período a período** (`CHART_PLUGINS_EXPERIMENTAL`, ligado aqui).
+- **Handlebars** + CSS do dashboard para cards de KPI customizados.
+- Já vêm na imagem: Sankey, Sunburst, Waterfall, Gantt, Gauge, Radar, Treemap,
+  Heatmap, Histogram, Graph, Tree, Bubble, mapas deck.gl (precisa `MAPBOX_API_KEY`).
+
+### Revisão dos gráficos existentes
+
+`scripts/chart_theme_review.py` (roda de uma estação, contra a API) migra o que
+estava preso a esquemas antigos: `color_scheme` explícito (`supersetColors`,
+`modernSunset`, ...) → `astecha`; escala sequencial explícita → `astechaPurple`;
+zera o cache `shared_label_colors` dos dashboards (rótulo → cor sorteada no esquema
+antigo); e fixa cor semântica para rótulos de status de qualidade (`OK_*`,
+`ATENCAO_*`, `ALERTA_*`, `CRITICO_*`, `SEM_INFORME_*`) na rampa de risco da marca.
+Dry-run por padrão; `--apply` grava.
+
+```bash
+export SUPERSET_BASE_URL=https://dashboard.astecha.com.br SUPERSET_USERNAME=... SUPERSET_PASSWORD=...
+python3 scripts/chart_theme_review.py          # mostra
+python3 scripts/chart_theme_review.py --apply  # grava
+```
+
+---
+
+## Upgrade de versão
+
+Registro do 6.0.0 → 6.1.0 (03/09/2026), que é o roteiro para os próximos:
+
+1. **Backup primeiro** — `sudo ./scripts/backup-db.sh` (fica em `/home/ubuntu/backups`).
+   O `pg_dump -Fc` do metadata DB (~3 MB) é o que importa; o tar do volume
+   `superset_home` é opcional (`SKIP_HOME=1`) — é cache do Playwright/thumbnails e
+   passa de 1 GB.
+2. Ler o [`UPDATING.md`](https://github.com/apache/superset/blob/6.1.0/UPDATING.md)
+   da versão. Na 6.1.0 nada quebrou para nós (ClickHouse, GAQ/WebSocket e exemplos
+   não se aplicam); adotamos a recomendação `DISTRIBUTED_COORDINATION_CONFIG`.
+3. Subir `TAG`/`BROWSER_TAG` em `docker/.env-local` e os defaults no
+   `docker-compose.yml` e `docker-browser/Dockerfile` (`ARG SUPERSET_VERSION`).
+4. `sudo ./scripts/upgrade-superset.sh 6.1.0` — pull, build do browser, `compose up -d`
+   (o `superset-init` roda `superset db upgrade` + `superset init`), espera health e
+   imprime `VERSION_STRING`.
+5. Conferir: login, um dashboard de cada tipo, um Report em dry-run (seção abaixo),
+   e *Settings > Themes* mostrando o tema Astecha.
+6. Rollback: `TAG`/`BROWSER_TAG` de volta + `pg_restore --clean` do dump (o
+   `db upgrade` não é reversível por migração).
+
+Armadilha nova: **`latest` não é uma versão.** Em 31/08/2026 a tag `latest` do
+Docker Hub passou de 6.0.0 para 6.1.0; antes deste upgrade o compose usava
+`${TAG:-latest}`, e qualquer `docker compose pull` teria migrado o banco sem
+ninguém pedir. Agora o default é a versão explícita.
 
 ---
 
