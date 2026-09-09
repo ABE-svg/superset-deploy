@@ -1,22 +1,39 @@
 # ---------------------------------------------------------------------------
-# Segredos — NUNCA commitar. O arquivo real vive só no servidor.
+# Secrets — NEVER commit. The real file lives only on the server.
+#
+# Note: docker/.env is intentionally NOT ignored. It holds non-secret defaults
+# and must be present in a fresh clone, because docker-compose.yml declares it
+# as a required env_file. Secrets go in docker/.env-local, which is loaded after
+# it and overrides it.
 # ---------------------------------------------------------------------------
 docker/.env-local
-docker/.env
 *.pem
 *.key
 *.p12
 
-# Certificados e desafios do certbot (gerados em runtime)
+# Certbot certificates and challenges (generated at runtime)
 conf/certbot/
 
-# Logs do nginx (bind mount)
+# Nginx logs (bind mount)
 logs/
 
-# Backups deixados por edições em produção
+# Backups left behind by edits made in production
 *.bak
 *.bak-*
 *.old
 
-# Sistema
+# Database dumps and backup archives (see scripts/backup-db.sh)
+backups/
+*.dump
+*.sql
+*.tgz
+
+# Database CA certificate downloaded from the OVHcloud control panel
+docker/ca.pem
+
+# Python
+__pycache__/
+*.pyc
+
+# System
 .DS_Store

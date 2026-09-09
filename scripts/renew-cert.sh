@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# Renova o certificado Let's Encrypt e recarrega o nginx com segurança.
+# Renews the Let's Encrypt certificate and reloads nginx safely.
 #
-# Por que um script em vez de dois comandos soltos: o `nginx -s reload` re-parseia
-# a config inteira, e o nginx resolve TODOS os upstreams nesse parse. Se um
-# container referenciado como upstream estiver parado, o reload FALHA e o nginx
-# segue servindo o certificado antigo — sem erro visível em lugar nenhum. Por
-# isso o `nginx -t` aqui é bloqueante e o script verifica o que está REALMENTE
-# sendo servido no fim, em vez de confiar na saída do certbot.
+# Why a script instead of two loose commands: `nginx -s reload` re-parses the
+# entire config, and nginx resolves ALL upstreams during that parse. If a
+# container referenced as an upstream is stopped, the reload FAILS and nginx
+# carries on serving the old certificate — with no visible error anywhere. That
+# is why the `nginx -t` here is a blocking gate, and why the script checks what
+# is REALLY being served at the end rather than trusting certbot's output.
 #
 set -euo pipefail
 
@@ -16,33 +16,33 @@ COMPOSE="${COMPOSE:-docker compose}"
 
 cd "$(dirname "$0")/.."
 
-echo "### Certificado atual"
+echo "### Current certificate"
 $COMPOSE run --rm --entrypoint "certbot certificates" certbot 2>&1 \
   | grep -E "Certificate Name|Expiry Date" || true
 
 echo
-echo "### Simulação (não gasta rate limit do Let's Encrypt)"
+echo "### Dry run (does not consume the Let's Encrypt rate limit)"
 $COMPOSE run --rm --entrypoint "certbot renew --dry-run" certbot
 
 echo
-echo "### Renovação"
+echo "### Renewal"
 $COMPOSE run --rm --entrypoint "certbot renew" certbot
 
 echo
-echo "### Testando a config do nginx ANTES de recarregar"
+echo "### Testing the nginx config BEFORE reloading"
 if ! $COMPOSE exec nginx nginx -t; then
   echo >&2
-  echo "ERRO: a config do nginx não valida — reload abortado." >&2
-  echo "O nginx continua no ar servindo o certificado ANTIGO." >&2
-  echo "Causa comum: 'host not found in upstream' porque algum container" >&2
-  echo "referenciado em conf/nginx/superset.conf está parado." >&2
+  echo "ERROR: the nginx config does not validate — reload aborted." >&2
+  echo "Nginx stays up, still serving the OLD certificate." >&2
+  echo "Common cause: 'host not found in upstream' because a container" >&2
+  echo "referenced in conf/nginx/superset.conf is stopped." >&2
   exit 1
 fi
 
 $COMPOSE exec nginx nginx -s reload
-echo "### nginx recarregado"
+echo "### nginx reloaded"
 
 echo
-echo "### O que está sendo servido agora (fonte da verdade)"
+echo "### What is being served right now (the source of truth)"
 echo | openssl s_client -connect localhost:443 -servername "$DOMAIN" 2>/dev/null \
   | openssl x509 -noout -dates -subject

@@ -1,21 +1,31 @@
 #!/usr/bin/env bash
-# Upgrade de versão do Superset (imagem oficial + nossa imagem com browser).
+# Superset version upgrade (official image + our image with the browser).
 #
-# Pré-requisitos (na ordem):
-#   1. ./scripts/backup-db.sh                       (SEMPRE — a migração do banco não volta sozinha)
-#   2. TAG e BROWSER_TAG apontando para a versão nova em docker/.env-local
-#      (e o default no docker-compose.yml / ARG SUPERSET_VERSION no docker-browser/Dockerfile)
-#   3. Ler o UPDATING.md da versão nova:
-#      https://github.com/apache/superset/blob/<versão>/UPDATING.md
+# Prerequisites (in order):
+#   1. ./scripts/backup-db.sh                       (ALWAYS — the database migration does not roll itself back)
+#   2. TAG and BROWSER_TAG pointing at the new version in docker/.env-local
+#      (and the default in docker-compose.yml / ARG SUPERSET_VERSION in docker-browser/Dockerfile)
+#   3. Read the UPDATING.md for the new version:
+#      https://github.com/apache/superset/blob/<version>/UPDATING.md
 #
-# O que faz: pull da imagem oficial, build da imagem com Chromium, `compose up -d`
-# (o serviço superset-init roda `superset db upgrade` + `superset init`), espera o
-# health e imprime a versão que subiu.
+# What it does: pulls the official image, builds the image with Chromium, runs
+# `compose up -d` (the superset-init service runs `superset db upgrade` +
+# `superset init`), waits for health and prints the version that came up.
 #
-# Uso: sudo ./scripts/upgrade-superset.sh 6.1.0
+# The metadata database is OVHcloud Managed PostgreSQL, an external service, so
+# `superset db upgrade` migrates a database this script does not control and
+# cannot roll back. Two consequences:
+#   - ./scripts/backup-db.sh is not optional. It is the only rollback path.
+#   - `--remove-orphans` below will delete containers for services that no
+#     longer exist in docker-compose.yml. That is intended (it retires the old
+#     local `db` container if you are upgrading from a pre-managed-database
+#     deployment), but be aware of it before running this on a host with other
+#     compose services in the same project.
+#
+# Usage: sudo ./scripts/upgrade-superset.sh 6.1.0
 set -euo pipefail
 
-VERSION="${1:?uso: $0 <versão, ex: 6.1.0>}"
+VERSION="${1:?usage: $0 <version, e.g. 6.1.0>}"
 COMPOSE_DIR="${COMPOSE_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 cd "$COMPOSE_DIR"
 
@@ -27,14 +37,14 @@ docker pull "apachesuperset.docker.scarf.sh/apache/superset:$VERSION"
 echo ">> build astecha/superset-browser:$VERSION"
 docker build --build-arg "SUPERSET_VERSION=$VERSION" -t "astecha/superset-browser:$VERSION" docker-browser/
 
-echo ">> compose up (superset-init roda db upgrade + init)"
+echo ">> compose up (superset-init runs db upgrade + init)"
 docker compose up -d --remove-orphans
 docker compose logs -f superset-init 2>&1 | sed -n '1,200p' &
 LOGPID=$!
 docker wait "$(docker compose ps -q superset-init)" >/dev/null
 kill $LOGPID 2>/dev/null || true
 
-echo ">> esperando health do superset"
+echo ">> waiting for the superset health check"
 for i in $(seq 1 60); do
   if docker compose exec -T superset curl -sf http://localhost:8088/health >/dev/null 2>&1; then break; fi
   sleep 5
@@ -42,9 +52,10 @@ done
 docker compose ps
 docker compose exec -T superset /app/.venv/bin/python -c "from superset import config; print('VERSION_STRING =', config.VERSION_STRING)"
 
-# O nginx resolve o upstream `superset` no parse da config; o container recriado
-# tem IP novo e o site fica em 502 até o reload (armadilha 2 do README).
-echo ">> reload do nginx (upstream recriado)"
+# Nginx resolves the `superset` upstream when it parses its config; the recreated
+# container has a new IP and the site stays on 502 until the reload (pitfall 2 in
+# the README).
+echo ">> reloading nginx (the upstream was recreated)"
 docker compose exec -T nginx nginx -t && docker compose exec -T nginx nginx -s reload
 curl -sk -o /dev/null -w "health via nginx: %{http_code}\n" https://127.0.0.1/health || true
-echo ">> ok. Rollback: TAG/BROWSER_TAG de volta + restore do dump (ver scripts/backup-db.sh)."
+echo ">> ok. Rollback: put TAG/BROWSER_TAG back + restore the dump (see scripts/backup-db.sh)."

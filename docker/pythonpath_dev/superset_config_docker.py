@@ -21,77 +21,140 @@ This file overrides settings from superset_config.py for production deployment
 """
 
 import os
+from urllib.parse import quote_plus
+
+# =========================================================================
+# METADATA DATABASE - OVHcloud Managed PostgreSQL
+# =========================================================================
+# The metadata database is an external managed service, not a container.
+#
+# Why this URI is built here instead of being left to upstream:
+# docker/pythonpath_dev/superset_config.py assembles it as a bare f-string,
+#
+#     f"{DATABASE_DIALECT}://{DATABASE_USER}:{DATABASE_PASSWORD}"
+#     f"@{DATABASE_HOST}:{DATABASE_PORT}/{DATABASE_DB}"
+#
+# with no hook for query parameters and no SQLALCHEMY_ENGINE_OPTIONS. There is
+# therefore no way to get `sslmode` through the DATABASE_* variables alone, and
+# TLS to a managed database over the public internet is mandatory. This file is
+# imported at the END of the upstream config (`from superset_config_docker import *`),
+# so the value below wins.
+#
+# Two further details this fixes:
+#   1. The password is URL-encoded. OVHcloud generates passwords containing
+#      characters that are significant in a URI (@ : / ? #); the upstream
+#      f-string does not encode them, which produces a URI that either fails to
+#      parse or silently connects to the wrong host.
+#   2. `sslmode` is a variable, so moving to `verify-full` later (with the CA
+#      certificate downloaded from the OVH control panel and DATABASE_SSLROOTCERT
+#      pointing at it) needs no code change.
+#
+# Note: nothing else reuses this database. RESULTS_BACKEND is a filesystem cache
+# under /app/superset_home/sqllab, and the Celery broker and result backend are
+# both Redis, so this is the only place TLS has to be enforced.
+
+
+def _require_db_env(name: str) -> str:
+    """Fail fast, with an actionable message, rather than building a broken URI."""
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(
+            f"{name} is not set. The metadata database is external (OVHcloud "
+            f"Managed PostgreSQL) and has no default. Set {name} in "
+            f"docker/.env-local — see docker/.env-local.example and DEPLOYMENT.md."
+        )
+    return value
+
+
+DATABASE_HOST = _require_db_env("DATABASE_HOST")
+# OVHcloud does NOT use 5432. It assigns a non-standard port, typically in the
+# 20000 range; take the exact value from the service page in the control panel.
+DATABASE_PORT = _require_db_env("DATABASE_PORT")
+DATABASE_DB = _require_db_env("DATABASE_DB")
+DATABASE_USER = _require_db_env("DATABASE_USER")
+DATABASE_PASSWORD = _require_db_env("DATABASE_PASSWORD")
+
+# require  = encrypt, but do not verify the server certificate (default here)
+# verify-ca / verify-full = also verify it; both need DATABASE_SSLROOTCERT
+DATABASE_SSLMODE = os.getenv("DATABASE_SSLMODE", "require")
+DATABASE_SSLROOTCERT = os.getenv("DATABASE_SSLROOTCERT", "")
+
+SQLALCHEMY_DATABASE_URI = (
+    f"postgresql+psycopg2://{quote_plus(DATABASE_USER)}:{quote_plus(DATABASE_PASSWORD)}"
+    f"@{DATABASE_HOST}:{DATABASE_PORT}/{DATABASE_DB}"
+    f"?sslmode={DATABASE_SSLMODE}"
+    + (f"&sslrootcert={quote_plus(DATABASE_SSLROOTCERT)}" if DATABASE_SSLROOTCERT else "")
+)
+
+# Recycle connections before the managed service's idle timeout closes them, and
+# check liveness before handing a connection to a request. Without pre-ping, the
+# first query after an idle period fails with "server closed the connection".
+SQLALCHEMY_ENGINE_OPTIONS = {
+    "pool_pre_ping": True,
+    "pool_recycle": 300,
+}
 
 # =========================================================================
 # ALERTS AND REPORTS CONFIGURATION
 # =========================================================================
+# Disabled by default: this deployment has NO SMTP server, so a report would
+# have no delivery channel. The whole feature is driven by one variable so that
+# its absence never blocks a deploy.
+#
+# To enable it later you need all three of:
+#   1. ALERT_REPORTS=true in docker/.env-local
+#   2. an SMTP server configured (SMTP_HOST/SMTP_PORT/SMTP_USER/... below,
+#      which are intentionally not defined here yet)
+#   3. the Chromium worker image running, for chart screenshots
+#      (docker compose --profile reports up -d)
+ALERT_REPORTS_ENABLED = os.getenv("ALERT_REPORTS", "false").strip().lower() == "true"
 
-# Enable Alerts and Reports feature
 FEATURE_FLAGS = {
-    "ALERT_REPORTS": True,
-    # Playwright + Chromium vêm na imagem astecha/superset-browser
-    # (ver docker-browser/Dockerfile), usada pelo serviço superset-worker.
-    # Com a flag ligada, WEBDRIVER_TYPE abaixo deixa de ter efeito:
-    # Playwright é sempre Chromium.
-    "PLAYWRIGHT_REPORTS_AND_THUMBNAILS": True,
-    # ---- Gráficos (6.x) ----
-    # Table V2 com AG Grid: barras nas células, formatação condicional por linha,
-    # pin/filtro por coluna, time shift. Vem na imagem, mas desligada por padrão.
+    "ALERT_REPORTS": ALERT_REPORTS_ENABLED,
+    # Playwright + Chromium ship in the browser image (see docker-browser/Dockerfile),
+    # used by the superset-worker service under the "reports" profile. With this
+    # flag on, WEBDRIVER_TYPE below no longer has any effect: Playwright is always
+    # Chromium.
+    #
+    # Tied to the same switch: turning it on while the worker is running the plain
+    # image (no Chromium) makes every screenshot and thumbnail fail.
+    "PLAYWRIGHT_REPORTS_AND_THUMBNAILS": ALERT_REPORTS_ENABLED,
+    # ---- Charts (6.x) ----
+    # Table V2 with AG Grid: in-cell bars, per-row conditional formatting,
+    # per-column pinning/filtering, time shift. Ships in the image but is off
+    # by default.
     "AG_GRID_TABLE_ENABLED": True,
-    # Libera os plugins experimentais (hoje: Big Number período a período).
+    # Enables the experimental plugins (currently: period-over-period Big Number).
     "CHART_PLUGINS_EXPERIMENTAL": True,
-    # Report de dashboard respeitando o estado salvo em `extra.dashboard`
-    # (abas e filtros nativos). Sem isto o worker ignora `nativeFilters` e manda
-    # o dashboard sem filtro — o report "uso-humano" depende disto
-    # (Período = Last month, Origem = prod, Tipo de usuário = Cliente).
-    "ALERT_REPORT_TABS": True,
+    # Dashboard reports that honour the state saved in `extra.dashboard`
+    # (tabs and native filters). Without this the worker ignores `nativeFilters`
+    # and sends the dashboard unfiltered.
+    "ALERT_REPORT_TABS": ALERT_REPORTS_ENABLED,
 }
-
-# ⚠️ IMPORTANTE: Desabilitar dry-run mode para enviar emails reais
-ALERT_REPORTS_NOTIFICATION_DRY_RUN = False
-
-# =========================================================================
-# SENDGRID / SMTP CONFIGURATION
-# =========================================================================
-
-# SendGrid SMTP Configuration (porta 465 com SSL)
-SMTP_HOST = os.getenv("MAIL_SERVER", "smtp.sendgrid.net")
-SMTP_PORT = int(os.getenv("MAIL_PORT", "465"))
-SMTP_USER = os.getenv("MAIL_USERNAME", "apikey")
-SMTP_PASSWORD = os.getenv("MAIL_PASSWORD", "")
-SMTP_MAIL_FROM = os.getenv("MAIL_DEFAULT_SENDER", "noreply@dashboard.astecha.com.br")
-
-# Configurações SSL para porta 465
-SMTP_SSL = True  # SSL direto na porta 465
-SMTP_STARTTLS = False  # Não usar STARTTLS quando SSL está ativo
-SMTP_SSL_SERVER_AUTH = True  # Verificar certificado do servidor
-
-# Prefixo opcional no assunto dos emails
-EMAIL_REPORTS_SUBJECT_PREFIX = "[Astecha Dashboard] "
 
 # =========================================================================
 # WEBDRIVER CONFIGURATION
 # =========================================================================
 
-# URL base interna (para o worker acessar o Superset)
-# Usar o nome do serviço Docker
+# Internal base URL (for the worker to reach Superset)
+# Uses the Docker service name
 WEBDRIVER_BASEURL = os.getenv(
     "SUPERSET_WEBDRIVER_BASEURL",
     "http://superset:8088/"
 )
 
-# URL base amigável (link que vai no email)
-# Usar o domínio público
+# User-friendly base URL (the link that goes into the email)
+# Uses the public domain
 WEBDRIVER_BASEURL_USER_FRIENDLY = os.getenv(
     "WEBDRIVER_BASEURL_USER_FRIENDLY",
     "http://dashboard.astecha.com.br/"
 )
 
-# Ignorado enquanto PLAYWRIGHT_REPORTS_AND_THUMBNAILS estiver True.
-# Mantido só como fallback caso a flag seja desligada.
+# Ignored while PLAYWRIGHT_REPORTS_AND_THUMBNAILS is True.
+# Kept only as a fallback in case the flag is turned off.
 WEBDRIVER_TYPE = os.getenv("WEBDRIVER_TYPE", "chrome")
 
-# Argumentos do Chrome para headless mode
+# Chrome arguments for headless mode
 WEBDRIVER_OPTION_ARGS = [
     "--force-device-scale-factor=2.0",
     "--high-dpi-support=2.0",
@@ -103,41 +166,44 @@ WEBDRIVER_OPTION_ARGS = [
     "--disable-extensions",
 ]
 
-# Tempos de espera para screenshots
+# Screenshot wait times
 SCREENSHOT_LOCATE_WAIT = 100
 SCREENSHOT_LOAD_WAIT = 600
 
 # -------------------------------------------------------------------------
-# Espera do Playwright: garantir que os graficos terminem de carregar dados
-# antes do print. A sequencia em utils/webdriver.py e:
-#   goto(wait_until=WAIT_EVENT) -> sleep(HEADSTART) -> espera .chart-container
-#   -> espera os .loading sumirem -> sleep(ANIMATION_WAIT) -> screenshot
+# Playwright waiting: making sure the charts have finished loading their data
+# before the screenshot is taken. The sequence in utils/webdriver.py is:
+#   goto(wait_until=WAIT_EVENT) -> sleep(HEADSTART) -> wait for .chart-container
+#   -> wait for the .loading elements to disappear -> sleep(ANIMATION_WAIT)
+#   -> screenshot
 #
-# O default "domcontentloaded" dispara assim que o HTML e parseado, ou seja
-# ANTES de qualquer query voltar. "networkidle" espera a rede silenciar, que e
-# o proxy pratico para "as consultas dos graficos terminaram".
+# The default "domcontentloaded" fires as soon as the HTML is parsed, that is
+# BEFORE any query has come back. "networkidle" waits for the network to fall
+# silent, which is the practical proxy for "the chart queries have finished".
 SCREENSHOT_PLAYWRIGHT_WAIT_EVENT = "networkidle"
 
-# Teto de cada espera individual do Playwright. Se a rede nunca silenciar, o
-# goto estoura esse timeout, e logado e o fluxo segue assim mesmo (nao perde o
-# print) — MAS a espera seguinte, `element.wait_for()` do seletor .standalone,
-# estoura de verdade e derruba o report ("Failed taking a screenshot").
+# Ceiling for each individual Playwright wait. If the network never falls
+# silent, `goto` exceeds this timeout, that is logged, and the flow carries on
+# anyway (the screenshot is not lost) — BUT the next wait, `element.wait_for()`
+# on the .standalone selector, times out for real and brings the report down
+# ("Failed taking a screenshot").
 #
-# 60s nao bastava para o dashboard uso-humano (20 charts, ~5,3k px de altura:
-# cai no caminho de screenshot em tiles) com force_screenshot ligado, que
-# re-executa as 20 queries. Medido em 03/09/2026: 3 tentativas manuais, 2
-# estouraram em 60s. 150s cobre o pior caso observado com folga.
+# 60s was not enough for the human-use dashboard (20 charts, ~5.3k px tall, so
+# it falls into the tiled screenshot path) with force_screenshot on, which
+# re-runs all 20 queries. Measured on 2026-09-03: 3 manual attempts, 2 of which
+# blew past 60s. 150s covers the worst observed case with room to spare.
 #
-# Nao conflita com o limite do Celery: para reports AGENDADOS o scheduler
-# (tasks/scheduler.py) define soft_time_limit = working_timeout + 1 = 3601s por
-# task, ignorando o global de 180s. O global so vale para chamada manual da
-# task, e a de thumbnail tem soft_time_limit=300s fixo — 150s cabe nos dois.
+# This does not conflict with the Celery limit: for SCHEDULED reports the
+# scheduler (tasks/scheduler.py) sets soft_time_limit = working_timeout + 1 =
+# 3601s per task, ignoring the 180s global. The global only applies to a manual
+# call of the task, and the thumbnail task has a fixed soft_time_limit of 300s —
+# 150s fits inside both.
 SCREENSHOT_PLAYWRIGHT_DEFAULT_TIMEOUT = 150000
 
-# A espera dos .loading so cobre os elementos existentes NAQUELE instante:
-# grafico que ainda nao comecou a renderizar (lazy-load abaixo da dobra) nao
-# tem .loading e por isso ninguem espera por ele. Esses dois sleeps fixos sao a
-# folga que cobre esse buraco.
+# The wait on .loading only covers the elements that exist AT THAT MOMENT: a
+# chart that has not started rendering yet (lazy-loaded below the fold) has no
+# .loading element, so nothing waits for it. These two fixed sleeps are the
+# slack that covers that gap.
 SCREENSHOT_SELENIUM_HEADSTART = 10
 SCREENSHOT_SELENIUM_ANIMATION_WAIT = 10
 
@@ -146,8 +212,8 @@ SCREENSHOT_SELENIUM_ANIMATION_WAIT = 10
 # EXECUTORS CONFIGURATION
 # =========================================================================
 
-# Por padrão, alertas são executados como o dono do alert/report
-# Se quiser usar um usuário fixo, descomente e configure:
+# By default, alerts run as the owner of the alert/report.
+# To use a fixed user instead, uncomment and configure:
 # from superset.tasks.types import FixedExecutor
 # ALERT_REPORTS_EXECUTORS = [FixedExecutor("admin")]
 
@@ -155,34 +221,30 @@ SCREENSHOT_SELENIUM_ANIMATION_WAIT = 10
 # ADDITIONAL FEATURES
 # =========================================================================
 
-# Permitir formatação de data no assunto do email (opcional)
-# FEATURE_FLAGS["DATE_FORMAT_IN_EMAIL_SUBJECT"] = True
-
-# Lista de métodos de notificação disponíveis
-ALERT_REPORTS_NOTIFICATION_METHODS = ["Email"]
-
-# Se quiser adicionar Slack no futuro, adicione suas configs aqui:
+# No notification method is configured: this deployment has no SMTP server.
+# Slack is the alternative that needs no mail server — to use it, set a token and
+# enable the flag here, and set ALERT_REPORTS=true in docker/.env-local:
 # SLACK_API_TOKEN = os.getenv("SLACK_API_TOKEN", "")
 # FEATURE_FLAGS["ALERT_REPORT_SLACK_V2"] = True
-# ALERT_REPORTS_NOTIFICATION_METHODS.append("Slack")
+# ALERT_REPORTS_NOTIFICATION_METHODS = ["Slack"]
 
 # =========================================================================
-# BRANDING, TEMA E PALETAS (Superset 6.x)
+# BRANDING, THEME AND PALETTES (Superset 6.x)
 # =========================================================================
-# O tema fica em JSON versionado (docker/themes/*.json) e é carregado aqui para
-# que o config continue sendo a única fonte da verdade. Na subida do app o
-# Superset faz upsert desses dois temas como "THEME_DEFAULT"/"THEME_DARK"
-# (is_system=True) na tabela `themes` — ver superset/commands/theme/seed.py.
-# Enquanto nenhum tema for marcado como "system default" na UI
-# (Settings > Themes), o que vale é o do config.
+# The theme lives in version-controlled JSON (docker/themes/*.json) and is
+# loaded here so that this config remains the single source of truth. On app
+# startup Superset upserts these two themes as "THEME_DEFAULT"/"THEME_DARK"
+# (is_system=True) into the `themes` table — see superset/commands/theme/seed.py.
+# As long as no theme is marked as "system default" in the UI
+# (Settings > Themes), the one from this config is what applies.
 #
-# Logos e demais assets estáticos: docker/assets/ é montado em
-# /app/superset/static/assets/astecha (ver docker-compose.yml), logo o caminho
-# público é /static/assets/astecha/<arquivo>.
+# Logos and other static assets: docker/assets/ is mounted at
+# /app/superset/static/assets/astecha (see docker-compose.yml), so the public
+# path is /static/assets/astecha/<file>.
 #
-# Fontes: o CSP do Superset (TALISMAN_CONFIG) só libera fonts.googleapis.com,
-# fonts.gstatic.com e use.typekit.*; por isso Fira Sans/Fira Code vêm do Google
-# Fonts em vez de self-hosted (THEME_FONT_URL_ALLOWED_DOMAINS).
+# Fonts: Superset's CSP (TALISMAN_CONFIG) only allows fonts.googleapis.com,
+# fonts.gstatic.com and use.typekit.*; that is why Fira Sans/Fira Code come from
+# Google Fonts rather than being self-hosted (THEME_FONT_URL_ALLOWED_DOMAINS).
 
 import json as _json
 from pathlib import Path as _Path
@@ -200,43 +262,43 @@ APP_ICON = "/static/assets/astecha/astecha-logo-light.png"
 THEME_DEFAULT = _load_theme("astecha-light.json")
 THEME_DARK = _load_theme("astecha-dark.json")
 
-# Paleta categórica = a mesma ASTECHA_PALETTE usada nos gráficos do home-app
-# (frontend/src/lib/echarts.js), para os dashboards do Superset e do app
-# lerem como um produto só. isDefault=True faz dela o esquema padrão de todo
-# gráfico novo e de todo gráfico que não fixou esquema.
+# Categorical palette = the same ASTECHA_PALETTE used by the home-app charts
+# (frontend/src/lib/echarts.js), so that the Superset dashboards and the app
+# read as a single product. isDefault=True makes it the default scheme for every
+# new chart and for every chart that has not pinned a scheme of its own.
 EXTRA_CATEGORICAL_COLOR_SCHEMES = [
     {
         "id": "astecha",
         "label": "Astecha",
-        "description": "Paleta categórica institucional (mesma do home-app)",
+        "description": "Institutional categorical palette (the same one as the home-app)",
         "isDefault": True,
         "colors": [
-            "#0D0D38",  # azul quase preto — âncora
-            "#001EAF",  # azul profundo
-            "#2044DC",  # azul
-            "#4571FF",  # azul claro
-            "#88AAFF",  # azul pastel
-            "#FF6B06",  # laranja
-            "#FFBB8D",  # laranja pastel
-            "#F8485E",  # vermelho
-            "#FF99AF",  # rosa
-            "#46E8E0",  # turquesa
-            "#B6FFE3",  # verde água
-            "#A6A6A6",  # cinza
-            "#118680",  # verde petróleo
-            "#DBDBF7",  # lilás claro
-            "#C65000",  # laranja queimado
+            "#0D0D38",  # near-black blue — anchor
+            "#001EAF",  # deep blue
+            "#2044DC",  # blue
+            "#4571FF",  # light blue
+            "#88AAFF",  # pastel blue
+            "#FF6B06",  # orange
+            "#FFBB8D",  # pastel orange
+            "#F8485E",  # red
+            "#FF99AF",  # pink
+            "#46E8E0",  # turquoise
+            "#B6FFE3",  # aqua green
+            "#A6A6A6",  # grey
+            "#118680",  # petrol green
+            "#DBDBF7",  # light lilac
+            "#C65000",  # burnt orange
         ],
     },
 ]
 
-# Escalas sequenciais/divergentes derivadas da escala de roxo/vermelho da marca
-# (astecha.css --purple-* / --red-*) e da rampa de risco (--risk-0..5).
+# Sequential/diverging scales derived from the brand's purple/red scale
+# (astecha.css --purple-* / --red-*) and from the risk ramp (--risk-0..5).
 EXTRA_SEQUENTIAL_COLOR_SCHEMES = [
     {
         "id": "astechaPurple",
-        "label": "Astecha — roxo",
-        "description": "Sequencial claro→escuro na escala de roxo da marca",
+        "label": "Astecha — purple",
+        "description": "Sequential light-to-dark on the brand's purple scale",
         "isDiverging": False,
         "isDefault": True,
         "colors": [
@@ -246,8 +308,8 @@ EXTRA_SEQUENTIAL_COLOR_SCHEMES = [
     },
     {
         "id": "astechaRedPurple",
-        "label": "Astecha — vermelho ↔ roxo",
-        "description": "Divergente: vermelho da marca ↔ roxo da marca",
+        "label": "Astecha — red ↔ purple",
+        "description": "Diverging: brand red ↔ brand purple",
         "isDiverging": True,
         "isDefault": False,
         "colors": [
@@ -257,8 +319,8 @@ EXTRA_SEQUENTIAL_COLOR_SCHEMES = [
     },
     {
         "id": "astechaRisk",
-        "label": "Astecha — risco (ok → crítico)",
-        "description": "Rampa de severidade sóbria: sálvia → âmbar → tijolo → marrom",
+        "label": "Astecha — risk (ok → critical)",
+        "description": "Muted severity ramp: sage → amber → brick → brown",
         "isDiverging": False,
         "isDefault": False,
         "colors": ["#4E7A63", "#B08A4A", "#A8703E", "#A85D4A", "#8A4438", "#6E3530"],
@@ -266,11 +328,12 @@ EXTRA_SEQUENTIAL_COLOR_SCHEMES = [
 ]
 
 # =========================================================================
-# COORDENAÇÃO DISTRIBUÍDA (novo na 6.1 — Global Task Framework)
+# DISTRIBUTED COORDINATION (new in 6.1 — Global Task Framework)
 # =========================================================================
-# Backend Redis unificado para locks e pub/sub entre workers. O UPDATING.md da
-# 6.1.0 recomenda configurar em toda instalação de produção com Redis. Reusa o
-# mesmo Redis/DB do CACHE_CONFIG do upstream (docker/pythonpath_dev/superset_config.py).
+# Unified Redis backend for locks and pub/sub between workers. The 6.1.0
+# UPDATING.md recommends configuring this on every production installation that
+# has Redis. It reuses the same Redis host/DB as the upstream CACHE_CONFIG
+# (docker/pythonpath_dev/superset_config.py).
 DISTRIBUTED_COORDINATION_CONFIG = {
     "CACHE_TYPE": "RedisCache",
     "CACHE_KEY_PREFIX": "signal_",
@@ -285,6 +348,6 @@ DISTRIBUTED_COORDINATION_CONFIG = {
 # LOGGING
 # =========================================================================
 
-# Aumentar log level se precisar debugar
+# Raise the log level if you need to debug
 # import logging
 # LOG_LEVEL = logging.DEBUG

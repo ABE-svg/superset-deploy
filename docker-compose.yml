@@ -16,20 +16,21 @@
 #
 
 # =========================================================================
-# DOCKER COMPOSE PARA PRODUÇÃO - OTIMIZADO
+# DOCKER COMPOSE FOR PRODUCTION - OPTIMISED
 # =========================================================================
-# Remove componentes desnecessários para produção (Node, Cypress)
-# Use imagem pré-compilada do Superset
+# Drops the components that are unnecessary in production (Node, Cypress).
+# Uses the pre-built Superset image.
 
 
-# Versão PINADA. Nunca usar `latest`: em 31/08/2026 a tag `latest` do Docker Hub
-# passou de 6.0.0 para 6.1.0 sem aviso, e um `docker compose pull` casual teria
-# feito o upgrade (com migração de banco) sem ninguém pedir. TAG e BROWSER_TAG
-# andam juntos — a imagem do browser é FROM apache/superset:${SUPERSET_VERSION}.
+# PINNED version. Never use `latest`: on 2026-08-31 the Docker Hub `latest` tag
+# moved from 6.0.0 to 6.1.0 without warning, and a casual `docker compose pull`
+# would have carried out the upgrade (database migration included) without anyone
+# asking for it. TAG and BROWSER_TAG move together — the browser image is built
+# FROM apache/superset:${SUPERSET_VERSION}.
 x-superset-image: &superset-image apachesuperset.docker.scarf.sh/apache/superset:${TAG:-6.1.0}
-# Mesma imagem + Playwright/Chromium, para os screenshots de Alerts & Reports.
+# The same image plus Playwright/Chromium, for the Alerts & Reports screenshots.
 # Build: docker build --build-arg SUPERSET_VERSION=6.1.0 -t astecha/superset-browser:6.1.0 docker-browser/
-# Só o worker precisa do browser (ver docs de Alerts and Reports).
+# Only the worker needs the browser (see the Alerts and Reports documentation).
 x-superset-browser-image: &superset-browser-image astecha/superset-browser:${BROWSER_TAG:-6.1.0}
 
 services:
@@ -68,21 +69,10 @@ services:
     networks:
       - superset
 
-  db:
-    env_file:
-      - path: docker/.env
-        required: true
-      - path: docker/.env-local
-        required: false
-    image: postgres:16
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${DATABASE_PORT:-5432}:5432"
-    volumes:
-      - db_home:/var/lib/postgresql/data
-      - ./docker/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
-    networks:
-      - superset
+  # NOTE: there is no `db` service. The metadata database is OVHcloud Managed
+  # PostgreSQL, an external service reached over TLS. Connection details live in
+  # docker/.env-local; the TLS-enforcing URI is built in
+  # docker/pythonpath_dev/superset_config_docker.py.
 
   superset:
     env_file:
@@ -91,21 +81,27 @@ services:
       - path: docker/.env-local
         required: false
     image: *superset-image
-    command: ["/app/docker/docker-bootstrap.sh", "app"]
+    # "app-gunicorn", NOT "app". The "app" branch of docker-bootstrap.sh runs
+    #   flask run --reload --debugger --without-threads
+    # which is the single-threaded development server with the Werkzeug debugger
+    # enabled — unsuitable and unsafe for production. "app-gunicorn" runs the
+    # image's /usr/bin/run-server.sh, i.e. real Gunicorn. Worker counts are tuned
+    # via SERVER_WORKER_AMOUNT in docker/.env-local.
+    command: ["/app/docker/docker-bootstrap.sh", "app-gunicorn"]
     restart: unless-stopped
     expose:
       - 8088
     depends_on:
-      db:
-        condition: service_started
       redis:
         condition: service_started
+      superset-init:
+        condition: service_completed_successfully
     user: root
     volumes:
       - ./docker:/app/docker
       - superset_home:/app/superset_home
-      # Assets da marca (logos) servidos em /static/assets/astecha/ — referenciados
-      # pelo tema em docker/themes/*.json e por APP_ICON no superset_config_docker.py.
+      # Brand assets (logos) served under /static/assets/astecha/ — referenced by
+      # the theme in docker/themes/*.json and by APP_ICON in superset_config_docker.py.
       - ./docker/assets:/app/superset/static/assets/astecha:ro
     networks:
       - superset
@@ -124,8 +120,6 @@ services:
     image: *superset-image
     command: ["/app/docker/docker-init.sh"]
     depends_on:
-      db:
-        condition: service_started
       redis:
         condition: service_started
     user: root
@@ -147,10 +141,10 @@ services:
     command: ["/app/docker/docker-bootstrap.sh", "worker"]
     restart: unless-stopped
     depends_on:
-      db:
-        condition: service_started
       redis:
         condition: service_started
+      superset-init:
+        condition: service_completed_successfully
     user: root
     volumes:
       - ./docker:/app/docker
@@ -173,10 +167,10 @@ services:
     command: ["/app/docker/docker-bootstrap.sh", "beat"]
     restart: unless-stopped
     depends_on:
-      db:
-        condition: service_started
       redis:
         condition: service_started
+      superset-init:
+        condition: service_completed_successfully
     user: root
     volumes:
       - ./docker:/app/docker
@@ -186,9 +180,10 @@ services:
     healthcheck:
       disable: true
 
-  # Só para Global Async Queries (GAQ), que NÃO usamos. Fica atrás de um profile
-  # para o `compose up -d` não subi-lo: sem GAQ o docker-bootstrap.sh responde
-  # "Unknown Operation!!!" e o container entra em restart loop (visto no upgrade 6.1.0).
+  # Only for Global Async Queries (GAQ), which we do NOT use. Kept behind a profile
+  # so that `compose up -d` does not start it: without GAQ, docker-bootstrap.sh
+  # answers "Unknown Operation!!!" and the container enters a restart loop (observed
+  # during the 6.1.0 upgrade).
   superset-websocket:
     profiles: ["gaq"]
     env_file:
@@ -202,8 +197,6 @@ services:
     ports:
       - "${WEBSOCKET_PORT:-8080}:8080"
     depends_on:
-      db:
-        condition: service_started
       redis:
         condition: service_started
     user: root
@@ -217,8 +210,6 @@ services:
 
 volumes:
   superset_home:
-    driver: local
-  db_home:
     driver: local
   redis:
     driver: local

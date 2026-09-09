@@ -8,7 +8,7 @@ fi
 domains=("${DOMAIN:-dashboard.astecha.com.br}")
 rsa_key_size=4096
 data_path="./conf/certbot"
-email="${EMAIL:?defina EMAIL=voce@dominio antes de rodar}" # usado para avisos de expiracao do Lets Encrypt
+email="${EMAIL:?set EMAIL=you@domain before running}" # used for Let's Encrypt expiry notices
 staging=0 # Set to 1 if you're testing your setup to avoid hitting request limits
 
 if [ -d "$data_path" ]; then
