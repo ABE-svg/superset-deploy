@@ -1,39 +1,44 @@
 # ---------------------------------------------------------------------------
-# Secrets — NEVER commit. The real file lives only on the server.
+# SECRETS - never commit.
 #
-# Note: docker/.env is intentionally NOT ignored. It holds non-secret defaults
-# and must be present in a fresh clone, because docker-compose.yml declares it
-# as a required env_file. Secrets go in docker/.env-local, which is loaded after
-# it and overrides it.
+# .env holds the real secret key, the database password and the admin password.
+# In production it is written on the server by Dokploy from the values you type
+# into its Environment tab; it must never exist in this repository.
+#
+# Only .env.example, which contains placeholders, is tracked.
 # ---------------------------------------------------------------------------
-docker/.env-local
+.env
+.env.*
+!.env.example
+
+# Certificates and keys
 *.pem
 *.key
 *.p12
+*.pfx
+*.crt
 
-# Certbot certificates and challenges (generated at runtime)
-conf/certbot/
-
-# Nginx logs (bind mount)
-logs/
-
-# Backups left behind by edits made in production
-*.bak
-*.bak-*
-*.old
-
-# Database dumps and backup archives (see scripts/backup-db.sh)
+# ---------------------------------------------------------------------------
+# Database dumps and backups (see scripts/backup-db.sh).
+# These contain your full metadata database, users included.
+# ---------------------------------------------------------------------------
 backups/
 *.dump
 *.sql
+*.sql.gz
 *.tgz
+*.tar.gz
 
-# Database CA certificate downloaded from the OVHcloud control panel
-docker/ca.pem
+# Editor backups left behind by edits made on a server
+*.bak
+*.bak-*
+*.old
+*~
 
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
 
 # System
 .DS_Store
+Thumbs.db

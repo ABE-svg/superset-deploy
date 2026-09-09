@@ -1,292 +1,622 @@
-# superset-deploy
+# Apache Superset — Production Deployment on OVHcloud
 
-Configuração de deploy de uma instância **Apache Superset 6.1.0** em Docker Compose,
-com **Alerts & Reports funcionando de verdade** — isto é, mandando print de gráfico
-por e-mail — e com o **tema visual da Astecha** (logo, cores, fontes e paleta dos
-gráficos) versionado como código.
+A production-ready Apache Superset 6.1.0 deployment, designed to be installed
+through web interfaces rather than a terminal. You will use the OVHcloud control
+panel and the Dokploy dashboard. Exactly one step requires a command line, and
+it is clearly marked.
 
-Este repositório guarda **só o que é nosso**: a imagem customizada com headless
-browser, o nginx com TLS, o override de configuração do Superset, o tema e os
-assets da marca, e os scripts de certificado, backup e upgrade. O Superset em si
-continua vindo da imagem oficial, **com a versão pinada** (nunca `latest`).
-
-Onde roda: EC2 `dashboards-prod` (`i-07a5ae79baa590070`, us-east-2), diretório
-`/home/ubuntu/superset`, acesso por **SSM** (`aws ssm start-session` / `send-command`;
-a porta 22 não é pública desde o zero-trust). URL: https://dashboard.astecha.com.br
-(via WARP).
+The metadata database is **OVHcloud Managed PostgreSQL**, an external service.
+There is no database container to operate, patch or back up yourself.
 
 ---
 
-## Por que este repositório existe
-
-A instalação padrão fica num clone do repositório upstream `apache/superset`, e
-isso cria um problema silencioso: **os dois arquivos mais importantes de um deploy
-real são gitignorados pelo próprio Superset.**
+## 1. Architecture
 
 ```
-docker/pythonpath_dev/.gitignore:19:*   →  superset_config_docker.py
-.gitignore:123:docker/*local*           →  docker/.env-local
+                        GitHub (this repository)
+                                  │
+                                  │  Dokploy pulls on deploy
+                                  ▼
+      ┌──────────────────────────────────────────────────────┐
+      │        OVHcloud Public Cloud instance (Ubuntu)        │
+      │                                                       │
+      │   Traefik  ── TLS termination, Let's Encrypt          │
+      │      │        (installed and managed by Dokploy)      │
+      │      ▼                                                │
+      │   superset  ── Gunicorn, port 8088, not published     │
+      │      │                                                │
+      │      ├── superset-worker  ── Celery, async tasks      │
+      │      ├── superset-beat    ── Celery scheduler         │
+      │      └── redis            ── cache + broker           │
+      │                                                       │
+      │   internal Docker network, nothing published          │
+      └───────────────────────────┬───────────────────────────┘
+                                  │  vRack private network
+                                  ▼
+                OVHcloud Managed PostgreSQL (metadata)
 ```
 
-O `git status` mostra a pasta limpa e passa a impressão de que não há nada para
-versionar — enquanto toda a configuração de produção (SMTP, feature flags,
-webdriver) mora exatamente ali. Além disso, um clone do upstream não aceita push
-e briga com `git pull` a cada alteração local.
+**What each component does.**
+
+| Component | Role | Where it runs |
+| --- | --- | --- |
+| Traefik | Receives HTTPS traffic, obtains and renews the certificate, forwards to Superset | Installed by Dokploy |
+| Superset | The web application itself | Container, port 8088, never published |
+| Celery worker | Async SQL Lab queries, dashboard thumbnails, cache warm-up | Container |
+| Celery beat | Triggers scheduled tasks; exactly one instance | Container |
+| Redis | Query result cache, dashboard filter state, Celery broker | Container, internal network only |
+| PostgreSQL | Dashboards, charts, users, permissions | OVHcloud managed service |
+
+Only Traefik is reachable from the internet. Superset, Redis and the workers sit
+on an internal Docker network with no published ports.
 
 ---
 
-## O problema principal que este setup resolve
+## 2. Prerequisites
 
-A imagem publicada `apache/superset` é o flavor **lean: não traz browser nenhum**.
-Todo Report que manda screenshot morre com:
+| You need | Notes |
+| --- | --- |
+| An OVHcloud account | With a payment method registered |
+| A Public Cloud project | Created from the OVHcloud control panel |
+| A domain name | This guide uses `superset.example.com` |
+| A GitHub account | To fork or host this repository |
 
-```
-Failed taking a screenshot ... chromedriver unexpectedly exited. Status code was: 127
-```
+### Choosing the instance size
 
-O `127` engana: parece binário ausente, mas é **biblioteca de sistema faltando**
-(`libglib`, `libnss`, `libnspr`, `libxcb`, `libdbus`). O selenium-manager do
-Superset baixa o chromedriver sozinho, ele não roda, e o ciclo se repete a cada
-execução — na nossa instância isso acumulou **3,9 GB** de cache com 10 versões do
-Chrome baixadas em loop.
+These are practical recommendations, not official Superset requirements.
+Consumption depends on how many people use it at once, how heavy the dashboards
+are, and how many Celery tasks run.
 
-A correção é [`docker-browser/Dockerfile`](docker-browser/Dockerfile): a imagem
-oficial + **Playwright com Chromium**, que é a abordagem recomendada pelo projeto
-desde a 4.1.x e o que o Dockerfile oficial faz via `--build-arg INCLUDE_CHROMIUM=true`.
+| Profile | vCPU | RAM | Disk | Suitable for |
+| --- | --- | --- | --- | --- |
+| Minimum | 2 | 4 GB | 40 GB | A handful of users, light dashboards. Dokploy itself needs 2 GB, so this is tight. |
+| **Recommended** | **2** | **8 GB** | **80 GB** | **Up to ~30 concurrent sessions. The default values in `.env.example` are sized for this.** |
+| Comfortable | 4 | 16 GB | 160 GB | Heavy SQL Lab use, large dashboards, many scheduled tasks |
 
----
-
-## Estrutura
-
-| Caminho | O que é |
-|---|---|
-| `docker-browser/Dockerfile` | imagem `apache/superset:${SUPERSET_VERSION}` + Playwright + Chromium |
-| `docker-compose.yml` | stack completa, versão pinada via `TAG`/`BROWSER_TAG`; só o `superset-worker` usa a imagem com browser |
-| `conf/nginx/` | `nginx.conf` + vhost TLS com headers de segurança |
-| `docker/pythonpath_dev/superset_config_docker.py` | override de config do Superset (SMTP, feature flags, esperas do screenshot, branding, tema, paletas) |
-| `docker/themes/astecha-light.json`, `astecha-dark.json` | tema Astecha (tokens Ant Design + overrides ECharts), carregado pelo config |
-| `docker/assets/` | logos da marca, montados em `/static/assets/astecha/` |
-| `docker/.env-local.example` | modelo do arquivo de segredos (o real nunca é commitado) |
-| `scripts/backup-db.sh` | backup do metadata DB + volume antes de qualquer upgrade |
-| `scripts/upgrade-superset.sh` | pull + build + `compose up` com migração, para subir de versão |
-| `scripts/chart_theme_review.py` | revisão dos charts/dashboards existentes para aderirem ao tema (via API) |
-| `scripts/init-letsencrypt.sh` | emissão inicial do certificado |
-| `scripts/renew-cert.sh` | renovação + reload seguro do nginx |
+Dokploy's own documented minimum is 2 GB RAM and 30 GB disk, before Superset.
+The disk fills with Docker images and build layers, so do not undersize it.
 
 ---
 
-## Deploy
+## 3. What this repository already does for you
+
+You do not need to write any Docker or Superset configuration. Already prepared:
+
+- **Pinned Superset 6.1.0.** Never `latest`, so an image pull cannot trigger an
+  unrequested database migration.
+- **Production web server.** Gunicorn with an explicit worker count, not Flask's
+  development server.
+- **External database wiring.** The connection URI is built from your variables,
+  with TLS enforced and passwords URL-encoded.
+- **Redis caching**, including the dashboard filter state cache that most
+  deployments forget and that breaks filters when running more than one worker.
+- **Reverse proxy support.** `ENABLE_PROXY_FIX` is set, so Superset generates
+  `https://` URLs instead of falling into a login redirect loop.
+- **Security defaults.** Secure, HTTP-only, SameSite cookies. CSRF enabled.
+  Containers run as an unprivileged user. Nothing but the web service is on the
+  proxy network.
+- **Healthchecks** on Superset, Redis and the Celery worker.
+- **Automatic initialisation.** Migrations, roles and the first admin account
+  are created on the first deploy.
+- **Memory limits** on every service, so one runaway query cannot take the host
+  down.
+
+---
+
+## 4. What you have to do
+
+```
+[ ] 1. Create the OVHcloud instance
+[ ] 2. Install Dokploy                  ← the only terminal step
+[ ] 3. Create the Managed PostgreSQL service
+[ ] 4. Create the database and note the credentials
+[ ] 5. Attach both to the private network and authorise access
+[ ] 6. Point your domain at the instance
+[ ] 7. Connect GitHub to Dokploy
+[ ] 8. Create the Compose application
+[ ] 9. Enter the environment variables
+[ ] 10. Add the domain and enable HTTPS
+[ ] 11. Deploy
+[ ] 12. Log in and verify
+```
+
+---
+
+## Step 1 — Create the instance (OVHcloud)
+
+**Go to:** [ovh.com/manager](https://www.ovh.com/manager) → **Public Cloud** →
+select your project → **Instances** → **Create an instance**
+
+| Field | Value |
+| --- | --- |
+| Region | Pick one close to you, for example Gravelines (GRA) |
+| Image | **Ubuntu 24.04** |
+| Model | **B3-8** (2 vCPU, 8 GB) — the recommended size |
+| SSH key | Add your public key. You cannot connect without it. |
+| Public network | Enabled, with a public IPv4 |
+| Private network | Enabled, on the vRack you will also attach the database to |
+
+**Do not** install any pre-configured application. Dokploy installs what it needs.
+
+When it is ready, note two addresses from the instance list:
+
+- the **public IPv4**, for DNS and for reaching the Dokploy panel
+- the **private IP** on the vRack, which the database will authorise
+
+---
+
+## Step 2 — Install Dokploy
+
+> ### ⚠️ The only step that requires a terminal
+>
+> Dokploy is the tool that gives you a web interface for everything else. It
+> cannot install itself through a web interface, so this one command is
+> unavoidable. Everything after this point is done by clicking.
+
+Connect to the instance over SSH and run:
 
 ```bash
-git clone <este-repo> superset-deploy && cd superset-deploy
+curl -sSL https://dokploy.com/install.sh | sh
+```
 
-# 1. Segredos (nunca commitados)
-cp docker/.env-local.example docker/.env-local
-$EDITOR docker/.env-local      # SUPERSET_SECRET_KEY, MAIL_PASSWORD, domínio
+The script installs Docker and Traefik if they are not already present. It fails
+if ports 80, 443 or 3000 are already in use.
 
-# 2. Imagem com o headless browser (só o worker precisa dela) — mesma versão do TAG
-docker build --build-arg SUPERSET_VERSION=6.1.0 -t astecha/superset-browser:6.1.0 docker-browser/
+When it finishes, open in your browser:
 
-# 3. Certificado (primeira vez)
-EMAIL=voce@dominio DOMAIN=seu.dominio ./scripts/init-letsencrypt.sh
+```
+http://YOUR_PUBLIC_IPv4:3000
+```
 
-# 4. Subir
+Create your administrator account immediately. Until you do, anyone who finds
+that address can claim it.
+
+---
+
+## Step 3 — Create the Managed PostgreSQL service (OVHcloud)
+
+**Go to:** **Public Cloud** → your project → **Databases** → **Create a database
+service**
+
+| Field | Value |
+| --- | --- |
+| Engine | **PostgreSQL**, version **16** |
+| Plan | **Essential** is enough for this workload |
+| Region | **The same region as your instance** |
+| Nodes | 1 |
+| Network | **Private network (vRack)** — the same one as the instance |
+
+Creation takes roughly fifteen minutes.
+
+> Choosing a different region from the instance sends your database traffic
+> across the public internet and adds latency to every query.
+
+---
+
+## Step 4 — Create the database and the user (OVHcloud)
+
+Open the service once it is active.
+
+**Tab "Users":** OVHcloud has already created an administrator user called
+`avnadmin`. Use the three-dot menu → **Reset password**, and copy the password
+immediately. It is displayed once and never shown again.
+
+> **Use `avnadmin` rather than creating your own user.** Since PostgreSQL 15, a
+> non-owner user cannot create tables in the `public` schema. A freshly created
+> user would make `superset db upgrade` fail with a permission error that is
+> tedious to diagnose. You can tighten this later, once everything works.
+
+**Tab "Databases":** click **Add a database** and name it `superset`. Do not
+reuse `defaultdb`.
+
+**Tab "General information":** note the **hostname** and the **port**.
+
+> The port is **not** 5432. OVHcloud assigns a non-standard port, usually in the
+> 20000 range. Copy the exact value.
+
+Use the **private (vRack) endpoint** hostname, not the public one.
+
+---
+
+## Step 5 — Authorise network access (OVHcloud)
+
+**Tab "Authorised IPs":** the database refuses every connection from an address
+that is not listed here, *before* checking the password. A missing entry looks
+exactly like a wrong password.
+
+Add the instance's **private vRack IP**, as a `/32`, for example
+`10.0.0.5/32`. Alternatively add the vRack subnet if you prefer.
+
+Do not add `0.0.0.0/0`. That would expose your database to the entire internet.
+
+---
+
+## Step 6 — Point your domain at the instance (OVHcloud)
+
+**Go to:** **Web Cloud** → **Domain names** → your domain → **DNS zone** →
+**Add an entry**
+
+| Field | Value |
+| --- | --- |
+| Type | **A** |
+| Subdomain | `superset` |
+| Target | your instance's **public IPv4** |
+| TTL | Default |
+
+This creates `superset.example.com`.
+
+**Verify propagation before continuing.** Let's Encrypt validates your domain by
+connecting to it; if DNS has not propagated, certificate issuance fails and
+repeated failures hit rate limits.
+
+Check with an online tool such as [dnschecker.org](https://dnschecker.org), or
+from any terminal:
+
+```bash
+dig +short superset.example.com
+```
+
+It must return your instance's public IPv4. Propagation usually takes minutes,
+occasionally hours. **Do not proceed until it does.**
+
+---
+
+## Step 7 — Connect GitHub to Dokploy
+
+Push this repository to your own GitHub account first.
+
+**In Dokploy:** **Settings** → **Git** → **GitHub** → **Connect**
+
+Authorise the Dokploy GitHub App and grant it access to the repository. This is
+what lets Dokploy pull your code and, optionally, redeploy automatically when you
+push.
+
+---
+
+## Step 8 — Create the application
+
+**In Dokploy:** **Projects** → **Create project** → name it `superset` →
+**Create service** → **Compose**
+
+| Field | Value |
+| --- | --- |
+| Provider | **GitHub** |
+| Repository | your fork of this repository |
+| Branch | `main` |
+| Compose Path | `./docker-compose.yml` |
+| Compose Type | **Docker Compose** |
+
+> **Choose "Docker Compose", not "Docker Stack".** Stack mode runs Docker Swarm,
+> which does not support the `build` directive this repository relies on.
+
+### Why Compose from GitHub, and not a prebuilt image
+
+**This is the recommended option, and here is why.**
+
+The stack is four coordinated containers — web, Celery worker, Celery beat and
+Redis — that must share a network, a volume and one set of environment
+variables. Compose describes all of that in a single reviewed file. Publishing a
+prebuilt image to a registry would add a build pipeline, a registry account and
+credentials to manage, and would still leave you needing this same Compose file
+to run the four services.
+
+The image itself is built on the server from a deliberately thin `Dockerfile`:
+the official `apache/superset:6.1.0` image plus one configuration file. Superset
+is not rebuilt from source, so the build takes seconds.
+
+**When you would use a prebuilt image instead:** if you deploy the same stack to
+several servers and want them to run a byte-identical image, or if your instance
+is too small to build. Neither applies to a single instance of this size.
+
+---
+
+## Step 9 — Enter the environment variables
+
+**In Dokploy:** open your application → **Environment** tab.
+
+Paste the variables there. Dokploy writes them to a `.env` file on the server,
+which the Compose file reads via `env_file`.
+
+> Dokploy does **not** inject interface variables into containers automatically.
+> This repository's Compose file declares `env_file: .env` on every service
+> precisely so that it does.
+
+Start from [`.env.example`](.env.example), which documents every variable. The
+minimum you must provide:
+
+```env
+SUPERSET_SECRET_KEY=<paste a generated key>
+POSTGRES_HOST=<private vRack hostname from step 4>
+POSTGRES_PORT=<the non-5432 port from step 4>
+POSTGRES_DB=superset
+POSTGRES_USER=avnadmin
+POSTGRES_PASSWORD=<the password from step 4>
+ADMIN_EMAIL=<your email>
+ADMIN_PASSWORD=<choose a strong password>
+```
+
+**Generating the secret key.** Run this anywhere, including your own laptop:
+
+```bash
+openssl rand -hex 32
+```
+
+> **Choose the secret key once, before the first deploy.** It encrypts the stored
+> passwords of every database connection you later create inside Superset.
+> Changing it afterwards makes them undecryptable and forces you to run
+> `superset re-encrypt-secrets`.
+
+---
+
+## Step 10 — Add the domain and enable HTTPS
+
+**In Dokploy:** your application → **Domains** tab → **Add Domain**
+
+| Field | Value |
+| --- | --- |
+| Host | `superset.example.com` |
+| Path | `/` |
+| Container Port | **8088** |
+| HTTPS | **Enabled** |
+| Certificate | **Let's Encrypt** |
+| Service Name | `superset` |
+
+Dokploy generates the Traefik routing labels for you at deploy time. You never
+write them by hand.
+
+> Pick the service named **`superset`**. The worker, beat and Redis services must
+> never be exposed.
+
+Certificates renew automatically. Traefik requests a new one well before the
+90-day expiry, with no action from you.
+
+---
+
+## Step 11 — Deploy
+
+Click **Deploy**.
+
+Watch the **Logs** tab. The order to expect:
+
+1. Docker builds the image, a few seconds
+2. `redis` starts and becomes healthy
+3. `superset-init` runs the migrations — **this is the long step**, one to three
+   minutes on an empty database. It prints `Initialisation complete`.
+4. `superset`, `superset-worker` and `superset-worker-beat` start
+5. The Superset healthcheck turns green
+
+The first deploy is the slow one. Later deploys skip most of this.
+
+---
+
+## Step 12 — Log in and verify
+
+Open `https://superset.example.com`.
+
+Log in with the username `admin` and the `ADMIN_PASSWORD` you set. **Change that
+password immediately**, from the user menu → **Info** → **Reset my password**.
+
+### Verification checklist
+
+| What | How |
+| --- | --- |
+| **HTTPS** | The padlock is present. Click it: the certificate is issued by Let's Encrypt and valid. |
+| **No redirect loop** | You reach the dashboard list after login rather than returning to the login page. This is what `ENABLE_PROXY_FIX` prevents. |
+| **PostgreSQL is in use** | Create a dashboard, then in Dokploy click **Redeploy**. If the dashboard is still there, your data is in the managed database and not in a container. |
+| **Redis** | Dokploy → your app → the `redis` service shows *healthy*. |
+| **Celery** | The `superset-worker` service shows *healthy*. |
+| **Services** | All show *running* except `superset-init`, which correctly shows *exited (0)*. |
+
+---
+
+## 🔐 Secrets — important
+
+**Never commit a `.env` file.** It is in `.gitignore`. Only `.env.example`, which
+contains placeholders, belongs in Git.
+
+**Never put a password in `docker-compose.yml`.** That file is committed. Every
+credential reaches the containers through Dokploy's environment variables.
+
+**Use different secrets per environment.** A test instance and a production
+instance must not share a secret key or a database password.
+
+**Before your first push**, confirm nothing sensitive is staged:
+
+```bash
+git status
+git ls-files | grep -E '\.env$|\.pem$|\.key$'
+```
+
+The second command must print nothing.
+
+If you ever commit a secret by accident, treat it as compromised: rotate it in
+the OVHcloud panel and in Dokploy. Removing the file in a later commit does not
+remove it from the repository history.
+
+---
+
+## 🔄 Updating
+
+### Updating your configuration
+
+```
+edit → commit → push → Dokploy → Redeploy
+```
+
+You can enable **Auto Deploy** in the application settings so that every push to
+`main` redeploys automatically. Convenient, but it means a mistaken push reaches
+production immediately. For a production instance, deploying manually is the
+safer habit.
+
+### Updating Superset itself
+
+1. **Take a backup first.** See below. A schema migration has no reverse.
+2. Read the release's `UPDATING.md` in the
+   [Superset repository](https://github.com/apache/superset/blob/master/UPDATING.md).
+3. Change `SUPERSET_VERSION` in the Dokploy **Environment** tab.
+4. Click **Deploy**. `superset-init` runs the migration automatically.
+
+### Rolling back
+
+Dokploy keeps previous deployments; redeploy an earlier one from the
+**Deployments** tab. **This is not enough on its own after a version upgrade**:
+the database schema has already been migrated forward and the older Superset
+will not understand it. A rollback across versions also requires restoring the
+database dump you took beforehand.
+
+---
+
+## Backups and restore
+
+**What OVHcloud does for you.** The managed PostgreSQL service is backed up
+automatically, with point-in-time restore from the control panel. This covers
+your dashboards, charts, users and permissions — everything that matters.
+
+**What is not backed up.**
+
+| Item | Status |
+| --- | --- |
+| Dashboards, charts, users, permissions | Backed up by OVHcloud |
+| `superset_home` volume (uploads, runtime files) | **Not backed up.** Lost if the instance is destroyed. |
+| Redis cache | Not backed up, and does not need to be. Rebuilds itself. |
+| Environment variables and secrets | **Not backed up.** Keep them in a password manager. |
+
+> A Docker volume is not a backup. It lives on the same machine as the thing it
+> would protect against losing.
+
+**Before a version upgrade**, take a portable dump. This is the one case
+OVHcloud's automatic backups do not cover well, because their schedule is not
+synchronised with your upgrade:
+
+```bash
+./scripts/backup-db.sh
+```
+
+It writes a timestamped `.dump` file to `./backups/`. **Copy it off the server.**
+Restoring is destructive and deliberately not automated; the command is
+documented at the top of the script.
+
+---
+
+## ✅ Final security checklist
+
+```
+[ ] HTTPS active, padlock shown in the browser
+[ ] Certificate valid and issued by Let's Encrypt
+[ ] Database reachable only from the private vRack IP, never 0.0.0.0/0
+[ ] Redis not published on any host port
+[ ] Superset port 8088 not published, reachable only through Traefik
+[ ] SUPERSET_SECRET_KEY randomly generated, never the example value
+[ ] Strong PostgreSQL password, taken from the OVHcloud panel
+[ ] Default admin password changed after first login
+[ ] No secret committed: `git ls-files | grep -E '\.env$'` prints nothing
+[ ] Dokploy panel protected by a strong password
+[ ] OVHcloud account protected by two-factor authentication
+[ ] Superset version pinned, no `latest` anywhere
+[ ] A database dump taken before the last version upgrade
+```
+
+---
+
+## Versions
+
+| Component | Version | Why |
+| --- | --- | --- |
+| Apache Superset | `6.1.0` | Pinned. On 2026-08-31 the `latest` tag moved from 6.0.0 to 6.1.0 unannounced; anyone tracking it would have run an unrequested database migration. |
+| PostgreSQL | `16` | OVHcloud managed. `scripts/backup-db.sh` uses a matching `pg_dump`. |
+| Redis | `7.4-alpine` | Pinned. Alpine keeps the image small. |
+| Python | Provided by the Superset image | Not chosen independently, to avoid dependency mismatches. |
+| Traefik | Provided by Dokploy | Managed for you, including certificates. |
+
+Changing the Superset version means changing `SUPERSET_VERSION`. The Dockerfile
+takes it as a build argument, so image and configuration never drift apart.
+
+---
+
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| `docker-compose.yml` | The production stack. This is what Dokploy runs. |
+| `Dockerfile` | Official Superset image plus the configuration file. |
+| `config/superset_config.py` | All Superset production settings. |
+| `.env.example` | Every variable, documented, with placeholders. |
+| `scripts/backup-db.sh` | Optional pre-upgrade database dump. |
+| `CLAUDE.md` | Architecture notes and the reasoning behind the design choices. |
+
+---
+
+## Troubleshooting
+
+### `superset-init` fails, or the database connection is refused
+
+Almost always one of four things, in order of likelihood:
+
+1. **The port is wrong.** OVHcloud does not use 5432. Check `POSTGRES_PORT`
+   against the control panel.
+2. **The IP is not authorised.** The instance's private vRack IP must be in the
+   database's authorised IPs. This is refused before authentication, so it looks
+   like a wrong password.
+3. **The wrong endpoint.** Use the private vRack hostname, not the public one.
+4. **The password is wrong.** Reset it in the panel and update it in Dokploy.
+
+### You log in and land back on the login page
+
+A redirect loop, caused by the proxy header configuration. `ENABLE_PROXY_FIX` is
+already set in `config/superset_config.py`, so check instead that the Dokploy
+domain has **HTTPS enabled** and that **Container Port** is `8088`.
+
+### The certificate is not issued
+
+Check DNS first: `dig +short superset.example.com` must return your public IPv4.
+Let's Encrypt cannot validate a domain that does not resolve.
+
+Also confirm ports 80 and 443 are open on the instance. Port 80 is required even
+for an HTTPS-only site, because the ACME challenge uses it.
+
+**Beware of rate limits.** Let's Encrypt allows five failed attempts per hostname
+per hour. If you hit that, fix the cause and wait; retrying makes it worse.
+
+### The worker restarts in a loop
+
+Look at the `superset-worker` logs in Dokploy. Usually it started before the
+migrations finished. The Compose file already gates it on `superset-init`
+completing successfully, so if this persists the real cause is in the init logs.
+
+### Dashboard filters reset at random
+
+This is the symptom of an unconfigured filter state cache with several Gunicorn
+workers. Already fixed here by `FILTER_STATE_CACHE_CONFIG` on Redis. If you see
+it, check that the `redis` service is healthy.
+
+### Out of memory, containers being killed
+
+Lower `SUPERSET_MEMORY_LIMIT` and `WORKER_MEMORY_LIMIT`, or move to a larger
+instance. Confirm the totals leave room for the operating system, Docker and
+Dokploy, which need roughly 2 GB between them.
+
+---
+
+## Testing locally before deploying
+
+Optional, and it does require a terminal. Useful for checking your configuration
+against a throwaway database rather than the managed one.
+
+```bash
+cp .env.example .env
+# Edit .env: point POSTGRES_* at any test PostgreSQL,
+# and set SESSION_COOKIE_SECURE=false since there is no HTTPS locally.
+
+docker network create dokploy-network   # normally created by Dokploy
 docker compose up -d
 ```
 
-O `docker/` do upstream (`docker-bootstrap.sh`, `docker-init.sh`, `.env`) continua
-vindo do repositório do Superset — este repo cobre apenas os arquivos próprios.
+Superset is not published on a host port by design, so to reach it locally add
+`ports: ["8088:8088"]` to the `superset` service temporarily. **Never commit
+that change.**
 
 ---
 
-## Tema Astecha (branding, cores, fontes, gráficos)
+## Licence
 
-Tudo é configuração, nada é fork: o Superset 6 tem tema por tokens (Ant Design v5)
-e overrides de ECharts por tema, e é isso que usamos.
-
-| Camada | Onde | O que controla |
-|---|---|---|
-| `THEME_DEFAULT` / `THEME_DARK` | `superset_config_docker.py` ← `docker/themes/*.json` | logo, nome do app, cor primária/links/estados, fonte (Fira Sans / Fira Code via Google Fonts), raio de borda |
-| `echartsOptionsOverrides` | dentro do JSON do tema | fonte dos gráficos, legenda com marcador redondo, tooltip sem borda e com sombra |
-| `echartsOptionsOverridesByChartType` | idem, chave = `viz_type` | barras com canto arredondado, linhas 2.5px, fatias de pizza/treemap com separador |
-| `EXTRA_CATEGORICAL_COLOR_SCHEMES` | `superset_config_docker.py` | paleta `astecha` (mesma `ASTECHA_PALETTE` do home-app), **default** para todo gráfico |
-| `EXTRA_SEQUENTIAL_COLOR_SCHEMES` | idem | `astechaPurple` (default), `astechaRedPurple` (divergente), `astechaRisk` (ok → crítico) |
-| `APP_NAME` / `APP_ICON` | idem | título da aba e logo do favicon/header |
-
-Como o tema entra no ar: na subida do app o Superset faz **upsert** de
-`THEME_DEFAULT`/`THEME_DARK` na tabela `themes` (`is_system=True`). Com
-`ENABLE_UI_THEME_ADMINISTRATION` (default `True`), a UI em *Settings > Themes*
-mostra esses dois como "system"; enquanto ninguém marcar outro tema como *system
-default* na UI, o que vale é o do config. **Se alguém setar um tema pela UI, ele
-passa a ganhar do config** — por isso a regra é: edita-se o JSON no repo, não na UI.
-
-Para testar uma mudança de tema sem deploy: cole o JSON em *Settings > Themes >
-+ Theme* e aplique só num dashboard (*Edit dashboard > ... > Theme*). Quando
-aprovar, leve para `docker/themes/` e faça deploy.
-
-### Ferramentas do 6.1 que substituem "plugin de gráfico"
-
-Não existe loja de extensões de gráficos para o Superset, e os plugins de terceiros
-listados no wiki oficial são de 2021–2023 (React 16 / `@superset-ui/core` 0.17) —
-não rodam na 6.x. O framework de *Extensions* (`.supx`) da 6.x também **não**
-registra tipos de gráfico (só views, comandos, menus, editores, SQL Lab). O que dá
-para usar sem rebuild:
-
-- **Editor de opções ECharts por gráfico** (6.1, aba *Customize > ECharts Options*):
-  JSON deep-merged por cima do que o Superset gera. Qualquer opção do ECharts
-  (gradiente, rótulo, sombra, `smooth`, etc.).
-- **Table V2 com AG Grid** (`AG_GRID_TABLE_ENABLED`, ligado aqui): barras nas
-  células, formatação condicional por linha, pin/filtro por coluna, time shift.
-- **Big Number período a período** (`CHART_PLUGINS_EXPERIMENTAL`, ligado aqui).
-- **Handlebars** + CSS do dashboard para cards de KPI customizados.
-- Já vêm na imagem: Sankey, Sunburst, Waterfall, Gantt, Gauge, Radar, Treemap,
-  Heatmap, Histogram, Graph, Tree, Bubble, mapas deck.gl (precisa `MAPBOX_API_KEY`).
-
-### Revisão dos gráficos existentes
-
-`scripts/chart_theme_review.py` (roda de uma estação, contra a API) migra o que
-estava preso a esquemas antigos: `color_scheme` explícito (`supersetColors`,
-`modernSunset`, ...) → `astecha`; escala sequencial explícita → `astechaPurple`;
-zera o cache `shared_label_colors` dos dashboards (rótulo → cor sorteada no esquema
-antigo); e fixa cor semântica para rótulos de status de qualidade (`OK_*`,
-`ATENCAO_*`, `ALERTA_*`, `CRITICO_*`, `SEM_INFORME_*`) na rampa de risco da marca.
-Dry-run por padrão; `--apply` grava.
-
-```bash
-export SUPERSET_BASE_URL=https://dashboard.astecha.com.br SUPERSET_USERNAME=... SUPERSET_PASSWORD=...
-python3 scripts/chart_theme_review.py          # mostra
-python3 scripts/chart_theme_review.py --apply  # grava
-```
-
----
-
-## Upgrade de versão
-
-Registro do 6.0.0 → 6.1.0 (03/09/2026), que é o roteiro para os próximos:
-
-1. **Backup primeiro** — `sudo ./scripts/backup-db.sh` (fica em `/home/ubuntu/backups`).
-   O `pg_dump -Fc` do metadata DB (~3 MB) é o que importa; o tar do volume
-   `superset_home` é opcional (`SKIP_HOME=1`) — é cache do Playwright/thumbnails e
-   passa de 1 GB.
-2. Ler o [`UPDATING.md`](https://github.com/apache/superset/blob/6.1.0/UPDATING.md)
-   da versão. Na 6.1.0 nada quebrou para nós (ClickHouse, GAQ/WebSocket e exemplos
-   não se aplicam); adotamos a recomendação `DISTRIBUTED_COORDINATION_CONFIG`.
-3. Subir `TAG`/`BROWSER_TAG` em `docker/.env-local` e os defaults no
-   `docker-compose.yml` e `docker-browser/Dockerfile` (`ARG SUPERSET_VERSION`).
-4. `sudo ./scripts/upgrade-superset.sh 6.1.0` — pull, build do browser, `compose up -d`
-   (o `superset-init` roda `superset db upgrade` + `superset init`), espera health,
-   imprime `VERSION_STRING` e **recarrega o nginx** — sem isso o site fica em 502,
-   porque o nginx guardou o IP do container antigo (armadilha 2).
-   Nota: a migração 6.0.0 → 6.1.0 levou ~2 min; o `.env-local` novo faz o compose
-   recriar também o `db` (só restart do Postgres, dados no volume).
-5. Conferir: login, um dashboard de cada tipo, um Report em dry-run (seção abaixo),
-   e *Settings > Themes* mostrando o tema Astecha.
-6. Rollback: `TAG`/`BROWSER_TAG` de volta + `pg_restore --clean` do dump (o
-   `db upgrade` não é reversível por migração).
-
-Armadilha nova: **`latest` não é uma versão.** Em 31/08/2026 a tag `latest` do
-Docker Hub passou de 6.0.0 para 6.1.0; antes deste upgrade o compose usava
-`${TAG:-latest}`, e qualquer `docker compose pull` teria migrado o banco sem
-ninguém pedir. Agora o default é a versão explícita.
-
----
-
-## Armadilhas descobertas na prática
-
-Cada uma destas custou tempo de diagnóstico. Estão anotadas aqui para não custarem
-de novo.
-
-### 1. `WEBDRIVER_BASEURL` apontando para o domínio público derruba TODOS os alertas
-
-Se o worker acessa o Superset pela URL pública, ele sai para a internet, volta pelo
-nginx e passa a **validar TLS**. Quando o certificado vence, todo alerta quebra com
-`SSL: CERTIFICATE_VERIFY_FAILED` — inclusive os que não tiram print nenhum, porque o
-caminho de CSV/dataframe usa a mesma base. Tem que ser a URL interna da rede docker:
-
-```
-SUPERSET_WEBDRIVER_BASEURL=http://superset:8088/
-```
-
-O link público que vai no corpo do e-mail é outro setting: `WEBDRIVER_BASEURL_USER_FRIENDLY`.
-
-### 2. O nginx recusa o reload e serve o certificado vencido em silêncio
-
-O `nginx -s reload` re-parseia a config inteira, e o nginx resolve **todos** os
-upstreams nesse parse. Um container parado que apareça como `upstream` faz o reload
-falhar — e o nginx segue no ar servindo o certificado antigo, sem erro visível.
-Pior: um `docker compose restart nginx` nessa situação **falha no boot e derruba o
-site**. Por isso `scripts/renew-cert.sh` roda `nginx -t` como gate e confere no fim
-o que está sendo servido de fato, via `openssl s_client`.
-
-### 3. `pip` não é o Python do Superset
-
-Na imagem oficial, `pip` no PATH é o do sistema (`/usr/local/bin/pip`), mas o
-Superset roda no venv `/app/.venv`. Instalar com `pip` puro coloca o pacote no
-interpretador errado e o import só falha em runtime. Use:
-
-```dockerfile
-uv pip install --python /app/.venv/bin/python playwright
-```
-
-### 4. `PLAYWRIGHT_BROWSERS_PATH` tem que ser caminho de sistema
-
-A imagem base tem `USER superset`, mas o compose roda os serviços como `root`. Se o
-browser for para o `$HOME`, um dos dois não o encontra. Daí
-`/usr/local/share/playwright-browsers`.
-
-### 5. Screenshot saindo antes dos gráficos carregarem
-
-A sequência de espera do Superset é:
-
-```
-goto(wait_until=SCREENSHOT_PLAYWRIGHT_WAIT_EVENT)
-  → sleep(SCREENSHOT_SELENIUM_HEADSTART)
-  → espera .chart-container
-  → espera os .loading sumirem
-  → sleep(SCREENSHOT_SELENIUM_ANIMATION_WAIT)
-  → print
-```
-
-O default do `WAIT_EVENT` é `domcontentloaded`, que dispara assim que o HTML é
-parseado — **antes de qualquer query voltar**. Usamos `networkidle`. E note que a
-espera dos `.loading` só cobre os elementos existentes *naquele instante*: gráfico
-que ainda nem começou a renderizar não tem `.loading`, e ninguém espera por ele —
-por isso os dois sleeps fixos.
-
-Teto: `CeleryConfig.task_soft_time_limit` é **180s** para a execução inteira do
-report. Não adianta aumentar as esperas sem olhar isso.
-
-### 6. Antes de culpar o tempo, meça
-
-"Gráfico não carregou no print" muitas vezes não é timing. Vale inspecionar o DOM
-depois do load — contar `.chart-container`, `.loading` restantes e a altura do
-dashboard. No nosso caso, o branco embaixo do print era **área vazia do próprio
-dashboard** (1874px de conteúdo num viewport de 2000px, `WEBDRIVER_WINDOW["dashboard"]`),
-não gráfico faltando.
-
----
-
-## Testar um report sem enviar e-mail para os destinatários reais
-
-O dry-run é checado **depois** do screenshot (`commands/report/execute.py`), então
-esse caminho exercita o pipeline de imagem por inteiro sem mandar nada a ninguém:
-
-```python
-from superset.app import create_app
-app_ = create_app()
-with app_.app_context():
-    from flask import current_app
-    current_app.config["ALERT_REPORTS_NOTIFICATION_DRY_RUN"] = True   # trava
-    from superset.commands.report.execute import AsyncExecuteReportScheduleCommand
-    from datetime import datetime; import uuid
-    AsyncExecuteReportScheduleCommand(str(uuid.uuid4()), <REPORT_ID>, datetime.utcnow()).run()
-```
-
-Para diagnosticar um alerta que falhou, o metadata DB é Postgres: as tabelas são
-`report_schedule` (coluna `last_state`) e `report_execution_log` (`error_message`).
-
----
-
-## Licença
-
-Os arquivos derivados do Apache Superset mantêm a licença Apache 2.0 original.
+Files derived from Apache Superset keep their original Apache 2.0 licence.

@@ -16,204 +16,208 @@
 #
 
 # =========================================================================
-# DOCKER COMPOSE FOR PRODUCTION - OPTIMISED
+# Apache Superset - production stack for Dokploy on an OVHcloud instance
 # =========================================================================
-# Drops the components that are unnecessary in production (Node, Cypress).
-# Uses the pre-built Superset image.
+#
+#   Internet -> Traefik (Dokploy, TLS) -> superset:8088
+#                                            |
+#                                            +-- redis          (internal only)
+#                                            +-- PostgreSQL     (OVHcloud managed, external)
+#
+# There is no PostgreSQL service here on purpose: the metadata database is
+# OVHcloud Managed PostgreSQL, reached over the vRack private network.
+# There is no nginx and no certbot either: Dokploy's Traefik terminates TLS and
+# obtains the Let's Encrypt certificate. Adding a second reverse proxy behind
+# the first would buy nothing and double the places a header can be lost.
+#
+# Values come from environment variables that Dokploy writes into a .env file
+# next to this one. Dokploy does NOT inject its UI variables into containers by
+# itself, which is why every service below declares `env_file: .env` explicitly.
+# =========================================================================
 
-
-# PINNED version. Never use `latest`: on 2026-08-31 the Docker Hub `latest` tag
-# moved from 6.0.0 to 6.1.0 without warning, and a casual `docker compose pull`
-# would have carried out the upgrade (database migration included) without anyone
-# asking for it. TAG and BROWSER_TAG move together — the browser image is built
-# FROM apache/superset:${SUPERSET_VERSION}.
-x-superset-image: &superset-image apachesuperset.docker.scarf.sh/apache/superset:${TAG:-6.1.0}
-# The same image plus Playwright/Chromium, for the Alerts & Reports screenshots.
-# Build: docker build --build-arg SUPERSET_VERSION=6.1.0 -t astecha/superset-browser:6.1.0 docker-browser/
-# Only the worker needs the browser (see the Alerts and Reports documentation).
-x-superset-browser-image: &superset-browser-image astecha/superset-browser:${BROWSER_TAG:-6.1.0}
+x-superset-common: &superset-common
+  # Every Superset service runs the same locally-built image. Compose builds it
+  # once and reuses it for the other three.
+  build:
+    context: .
+    args:
+      SUPERSET_VERSION: ${SUPERSET_VERSION:-6.1.0}
+  image: superset-ovh:${SUPERSET_VERSION:-6.1.0}
+  env_file: .env
+  environment:
+    # Timestamps are stored in UTC regardless; this affects log readability and
+    # how the container renders local times.
+    TZ: ${TZ:-Europe/Paris}
+  restart: unless-stopped
+  networks:
+    - internal
+  volumes:
+    - superset_home:/app/superset_home
 
 services:
-  nginx:
-    image: nginx:latest
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./conf/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./conf/nginx/superset.conf:/etc/nginx/conf.d/superset.conf:ro
-      - ./conf/certbot/conf:/etc/letsencrypt:ro
-      - ./conf/certbot/www:/var/www/certbot:ro
-      - ./logs:/var/log/nginx
-    depends_on:
-      - superset
-    networks:
-      - superset
-  
-  certbot:
-    image: certbot/certbot
-    volumes:
-      - ./conf/certbot/conf:/etc/letsencrypt
-      - ./conf/certbot/www:/var/www/certbot
-    networks:
-      - superset
-
-  redis:
-    image: redis:7
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
-    volumes:
-      - redis:/data
-    networks:
-      - superset
-
-  # NOTE: there is no `db` service. The metadata database is OVHcloud Managed
-  # PostgreSQL, an external service reached over TLS. Connection details live in
-  # docker/.env-local; the TLS-enforcing URI is built in
-  # docker/pythonpath_dev/superset_config_docker.py.
-
+  # -----------------------------------------------------------------------
+  # Web application. The ONLY service Traefik can reach.
+  # -----------------------------------------------------------------------
   superset:
-    env_file:
-      - path: docker/.env
-        required: true
-      - path: docker/.env-local
-        required: false
-    image: *superset-image
-    # "app-gunicorn", NOT "app". The "app" branch of docker-bootstrap.sh runs
-    #   flask run --reload --debugger --without-threads
-    # which is the single-threaded development server with the Werkzeug debugger
-    # enabled — unsuitable and unsafe for production. "app-gunicorn" runs the
-    # image's /usr/bin/run-server.sh, i.e. real Gunicorn. Worker counts are tuned
-    # via SERVER_WORKER_AMOUNT in docker/.env-local.
+    <<: *superset-common
+    # "app-gunicorn", not "app". The "app" branch of the image's bootstrap
+    # script starts Flask's development server with the auto-reloader and the
+    # Werkzeug debugger - single-threaded, and an unacceptable production
+    # exposure. This branch runs real Gunicorn via /usr/bin/run-server.sh.
     command: ["/app/docker/docker-bootstrap.sh", "app-gunicorn"]
-    restart: unless-stopped
-    expose:
-      - 8088
     depends_on:
       redis:
-        condition: service_started
+        condition: service_healthy
       superset-init:
         condition: service_completed_successfully
-    user: root
-    volumes:
-      - ./docker:/app/docker
-      - superset_home:/app/superset_home
-      # Brand assets (logos) served under /static/assets/astecha/ — referenced by
-      # the theme in docker/themes/*.json and by APP_ICON in superset_config_docker.py.
-      - ./docker/assets:/app/superset/static/assets/astecha:ro
+    # `expose`, never `ports`: reachable from Traefik over the Docker network,
+    # never published on the host. Nothing but 80, 443 and the Dokploy panel
+    # should be listening on a public interface.
+    expose:
+      - "8088"
     networks:
-      - superset
+      - internal
+      # Traefik lives on this external network. Without it, Dokploy can attach a
+      # domain but requests will never reach the container.
+      - dokploy-network
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
       interval: 30s
       timeout: 10s
       retries: 5
+      # Generous: the first boot loads the whole application before answering.
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          memory: ${SUPERSET_MEMORY_LIMIT:-3g}
 
+  # -----------------------------------------------------------------------
+  # One-shot initialisation: schema migration, roles, admin account.
+  # Runs to completion on every deploy; everything else waits for it.
+  # -----------------------------------------------------------------------
   superset-init:
-    env_file:
-      - path: docker/.env
-        required: true
-      - path: docker/.env-local
-        required: false
-    image: *superset-image
-    command: ["/app/docker/docker-init.sh"]
+    <<: *superset-common
+    # Not a long-running service: restarting it on exit would loop forever.
+    restart: "no"
     depends_on:
       redis:
-        condition: service_started
-    user: root
-    volumes:
-      - ./docker:/app/docker
-      - superset_home:/app/superset_home
-    networks:
-      - superset
+        condition: service_healthy
+    # `create-admin` is intentionally tolerant. It exits non-zero when the user
+    # already exists, which is the normal case on every redeploy after the
+    # first; without `|| true` the whole stack would refuse to start.
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        echo "==> Applying database migrations"
+        superset db upgrade
+        echo "==> Creating admin user (ignored if it already exists)"
+        superset fab create-admin \
+          --username "${ADMIN_USERNAME:-admin}" \
+          --firstname "${ADMIN_FIRSTNAME:-Admin}" \
+          --lastname "${ADMIN_LASTNAME:-User}" \
+          --email "${ADMIN_EMAIL:?ADMIN_EMAIL must be set}" \
+          --password "${ADMIN_PASSWORD:?ADMIN_PASSWORD must be set}" || true
+        echo "==> Creating default roles and permissions"
+        superset init
+        echo "==> Initialisation complete"
     healthcheck:
       disable: true
 
+  # -----------------------------------------------------------------------
+  # Celery worker: async SQL Lab queries, dashboard thumbnails, cache warm-up.
+  # -----------------------------------------------------------------------
   superset-worker:
-    env_file:
-      - path: docker/.env
-        required: true
-      - path: docker/.env-local
-        required: false
-    image: *superset-browser-image
+    <<: *superset-common
     command: ["/app/docker/docker-bootstrap.sh", "worker"]
-    restart: unless-stopped
     depends_on:
       redis:
-        condition: service_started
+        condition: service_healthy
       superset-init:
         condition: service_completed_successfully
-    user: root
-    volumes:
-      - ./docker:/app/docker
-      - superset_home:/app/superset_home
-    networks:
-      - superset
     healthcheck:
-      test: ["CMD-SHELL", "celery -A superset.tasks.celery_app:app inspect ping -d celery@$$HOSTNAME"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
+      test:
+        - "CMD-SHELL"
+        - "celery -A superset.tasks.celery_app:app inspect ping -d celery@$$HOSTNAME"
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          memory: ${WORKER_MEMORY_LIMIT:-2g}
 
+  # -----------------------------------------------------------------------
+  # Celery beat: schedules the periodic tasks the worker executes.
+  # Exactly one instance must run, or scheduled tasks fire more than once.
+  # -----------------------------------------------------------------------
   superset-worker-beat:
-    env_file:
-      - path: docker/.env
-        required: true
-      - path: docker/.env-local
-        required: false
-    image: *superset-image
+    <<: *superset-common
     command: ["/app/docker/docker-bootstrap.sh", "beat"]
-    restart: unless-stopped
     depends_on:
       redis:
-        condition: service_started
+        condition: service_healthy
       superset-init:
         condition: service_completed_successfully
-    user: root
-    volumes:
-      - ./docker:/app/docker
-      - superset_home:/app/superset_home
-    networks:
-      - superset
     healthcheck:
       disable: true
+    deploy:
+      resources:
+        limits:
+          memory: ${BEAT_MEMORY_LIMIT:-512m}
 
-  # Only for Global Async Queries (GAQ), which we do NOT use. Kept behind a profile
-  # so that `compose up -d` does not start it: without GAQ, docker-bootstrap.sh
-  # answers "Unknown Operation!!!" and the container enters a restart loop (observed
-  # during the 6.1.0 upgrade).
-  superset-websocket:
-    profiles: ["gaq"]
-    env_file:
-      - path: docker/.env
-        required: true
-      - path: docker/.env-local
-        required: false
-    image: *superset-image
-    command: ["/app/docker/docker-bootstrap.sh", "websocket"]
+  # -----------------------------------------------------------------------
+  # Redis: cache and Celery broker. Internal network only, never published.
+  # -----------------------------------------------------------------------
+  redis:
+    image: redis:7.4-alpine
     restart: unless-stopped
-    ports:
-      - "${WEBSOCKET_PORT:-8080}:8080"
-    depends_on:
-      redis:
-        condition: service_started
-    user: root
+    # No `ports`. Redis has no authentication configured here, which is safe
+    # precisely because it is unreachable from outside the Docker network.
+    # Publishing it, even on 127.0.0.1, would widen that surface for no gain.
+    command:
+      - redis-server
+      - --save
+      - "60"
+      - "1"
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-512mb}
+      # Evict the least-recently-used cache entries instead of returning errors
+      # when memory fills. Correct for a cache; it is why the Celery broker uses
+      # a different logical database.
+      - --maxmemory-policy
+      - allkeys-lru
     volumes:
-      - ./docker:/app/docker
-      - superset_home:/app/superset_home
+      - redis_data:/data
     networks:
-      - superset
+      - internal
     healthcheck:
-      disable: true
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: ${REDIS_MEMORY_LIMIT:-768m}
 
 volumes:
+  # SQL Lab uploads and assets written at runtime. NOT a backup: the metadata
+  # (dashboards, charts, users) lives in OVHcloud Managed PostgreSQL, and this
+  # volume disappears with the instance.
   superset_home:
-    driver: local
-  redis:
-    driver: local
+  # Redis persistence. Losing it costs a cold cache, nothing more.
+  redis_data:
 
 networks:
-  superset:
+  # Reachable only between the containers below. Redis, the workers and the
+  # init job are on this network alone and have no route to or from the internet.
+  internal:
     driver: bridge
+  # Created by Dokploy when it installs Traefik. `external: true` means compose
+  # attaches to it rather than trying to create it.
+  dokploy-network:
+    external: true
