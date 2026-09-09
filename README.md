@@ -143,6 +143,30 @@ When it is ready, note two addresses from the instance list:
 - the **public IPv4**, for DNS and for reaching the Dokploy panel
 - the **private IP** on the vRack, which the database will authorise
 
+### Open the required ports
+
+Three ports must be reachable from the internet, or the next steps fail in ways
+that look like something else:
+
+| Port | Needed for | Symptom if closed |
+| --- | --- | --- |
+| 22 | SSH, for the single install step | You cannot connect at all |
+| 80 | Let's Encrypt validation | The certificate is never issued |
+| 443 | HTTPS traffic | The site is unreachable |
+| 3000 | The Dokploy panel | You cannot open the dashboard |
+
+Port 80 is required **even though the site is HTTPS-only**, because the ACME
+challenge that proves you own the domain arrives over plain HTTP.
+
+OVHcloud Public Cloud instances do not apply a restrictive firewall by default,
+so usually there is nothing to do. Check under **Public Cloud** → your instance →
+**Security groups** if one is attached. If you have enabled `ufw` on the instance
+yourself, allow those four ports.
+
+> **Port 3000 exposes the Dokploy panel to the internet.** Give it a strong
+> password immediately in the next step. Once your domain works, you can attach a
+> domain to Dokploy itself and close 3000 to the public.
+
 ---
 
 ## Step 2 — Install Dokploy
