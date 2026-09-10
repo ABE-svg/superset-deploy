@@ -244,8 +244,8 @@ you do not control is never worth the doubt.
 ### Reducing the exposure afterwards
 
 Once your domain works, you can attach a domain to Dokploy itself under
-**Settings** → **Server** and then close port 3000 to the public, so the panel is
-no longer reachable by IP.
+**Settings** → **Web Server** and then close port 3000 to the public, so the
+panel is no longer reachable by IP.
 
 ---
 
