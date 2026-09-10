@@ -426,6 +426,18 @@ openssl rand -hex 32
 
 ## Step 10 — Add the domain and enable HTTPS
 
+> ### ⚠️ Deploy once first, or you will see "service not found"
+>
+> Dokploy only learns the service names inside `docker-compose.yml` (`superset`,
+> `redis`, and so on) once it has actually deployed the stack. Adding a domain
+> before that first deploy fails, because there is nothing yet to attach it to.
+>
+> **Do this instead:** jump to [Step 11](#step-11--deploy) now, click **Deploy**,
+> and wait for it to finish — Superset will come up reachable only inside
+> Dokploy's network, with no domain and no HTTPS yet, which is safe. Then come
+> back here to attach the domain. The deploy in Step 11 is safe to run again
+> afterwards, once the domain is in place.
+
 **In Dokploy:** your application → **Domains** tab → **Add Domain**
 
 | Field | Value |
