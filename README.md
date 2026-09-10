@@ -186,14 +186,66 @@ curl -sSL https://dokploy.com/install.sh | sh
 The script installs Docker and Traefik if they are not already present. It fails
 if ports 80, 443 or 3000 are already in use.
 
-When it finishes, open in your browser:
+### Claim the administrator account NOW
+
+> ### ⚠️ Do this within a minute of the install finishing
+>
+> Port 3000 is open to the entire internet, and Dokploy hands the administrator
+> account to **whoever reaches `/register` first**. That is not a bug; it is how
+> first-run setup works. Until you claim it, your server is unowned.
+
+As soon as the script finishes, open:
 
 ```
 http://YOUR_PUBLIC_IPv4:3000
 ```
 
-Create your administrator account immediately. Until you do, anyone who finds
-that address can claim it.
+You will land on the registration form. Fill in an e-mail and a strong password
+and submit. **Do not go and read the rest of this guide first.**
+
+This account is Dokploy's own, and it has nothing to do with the Superset admin
+account created later in step 11. They are two different logins on two different
+applications.
+
+### If you see "Admin is already created" or "Invalid email or password"
+
+An administrator account already exists on that Dokploy instance. Registration is
+a one-time event: once claimed, `/register` redirects to `/` and only the login
+form remains.
+
+There are two possibilities, and only one of them is safe.
+
+**You created it yourself and mistyped the password.** Sign in at the root URL,
+not `/register`:
+
+```
+http://YOUR_PUBLIC_IPv4:3000/
+```
+
+If you cannot remember the password, Dokploy documents a reset procedure at
+[docs.dokploy.com/docs/core/reset-password](https://docs.dokploy.com/docs/core/reset-password),
+which requires SSH access to the server.
+
+**You never created it.** Then somebody else claimed your server. Do not try to
+recover the account and do not continue on that instance: you have no way of
+knowing what was changed while it was under someone else's control.
+
+Since nothing of value is installed yet, the fastest and safest fix is to start
+over:
+
+1. In **Public Cloud** → **Instances**, delete the instance.
+2. Create a new one, following step 1 again.
+3. Re-run the install script.
+4. **Claim the account immediately**, before doing anything else.
+
+Rebuilding takes about twenty minutes. Recovering an instance whose admin account
+you do not control is never worth the doubt.
+
+### Reducing the exposure afterwards
+
+Once your domain works, you can attach a domain to Dokploy itself under
+**Settings** → **Server** and then close port 3000 to the public, so the panel is
+no longer reachable by IP.
 
 ---
 
@@ -355,7 +407,7 @@ POSTGRES_PORT=<the non-5432 port from step 4>
 POSTGRES_DB=superset
 POSTGRES_USER=avnadmin
 POSTGRES_PASSWORD=<the password from step 4>
-ADMIN_EMAIL=<your email>
+ADMIN_EMAIL=admin@superset-minard-test.fr
 ADMIN_PASSWORD=<choose a strong password>
 ```
 
